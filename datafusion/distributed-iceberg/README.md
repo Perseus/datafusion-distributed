@@ -84,10 +84,9 @@ reading and deliver descriptors through the coordinator's feed.
 
 Eager scans derive row counts and bytes from selected files and cap task estimates
 by the number of selected files. Predicates or deletes make row counts inexact;
-empty selections have exactly zero rows. Whole-snapshot column statistics are
-skipped when they would describe a different row set. Lazy scans retain snapshot
-statistics and task-size estimates. Selected-file column statistics remain a
-separate change. Task-local eager variants and decoded plans report unknown
+empty selections have exactly zero rows. When column statistics are enabled,
+eager scans aggregate selected-file metrics. Lazy scans retain snapshot statistics
+and task-size estimates. Task-local eager variants and decoded plans report unknown
 statistics rather than applying whole-snapshot aggregates to a subset.
 
 Both scans keep the filters DataFusion pushes into them, including the dynamic
@@ -101,6 +100,21 @@ the filters. It skips the file when the file's partition value can't match them.
 it gives the filters to the reader, which uses them to skip row groups. The reader only gets
 them when `iceberg.row_group_filtering_enabled` is on and `iceberg.row_selection_enabled` is
 off. The `files_with_dynamic_filter` metric counts the files the reader got them for.
+
+## Selected-file statistics
+
+With `iceberg.column_stats_enabled=true`, eager scans reconstruct column bytes,
+min/max bounds, and null counts from the **selected files**. Missing metrics remain
+unknown. Bounds are inexact; null counts also become inexact when predicates or
+deletes may remove rows. Nested column bytes sum leaf sizes without inventing
+parent bounds or null counts.
+
+Snapshot distinct-count estimates are retained as an inexact fallback, capped by
+selected-file row counts when known. They are not recomputed for the selected
+files and can overestimate the filtered result. Sum statistics remain unknown.
+
+Another manifest pass is needed because the pinned Iceberg API does not retain
+column metrics in file tasks. Scan task counts continue to use whole-file bytes.
 
 ```bash
 cargo test -p datafusion-distributed-iceberg -p datafusion-distributed-iceberg-test-tools
