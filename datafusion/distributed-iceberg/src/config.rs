@@ -25,6 +25,8 @@ extensions_options! {
         /// skip row groups, when `row_group_filtering_enabled` is on and
         /// `row_selection_enabled` is off.
         pub dynamic_filtering_enabled: bool, default = false
+        /// Balance eager files by bytes; false keeps task-first round-robin assignment.
+        pub greedy_file_assignment: bool, default = true
     }
 }
 
