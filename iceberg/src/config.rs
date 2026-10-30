@@ -18,6 +18,12 @@ extensions_options! {
         pub column_stats_enabled: bool, default = false
         /// Discover and retain file tasks during physical planning instead of execution.
         pub eager_file_planning: bool, default = false
+        /// Whether to prune data while reading with the latest values of dynamic filters pushed
+        /// into the scan (for example a hash join's build-side bounds). Each data file uses the
+        /// values the filters hold when its read starts; the scan never waits for them. Prunes
+        /// row groups, and also pages when `row_selection_enabled` is set. Results are unchanged:
+        /// the filters are still applied above the scan.
+        pub dynamic_filter_pruning_enabled: bool, default = false
     }
 }
 

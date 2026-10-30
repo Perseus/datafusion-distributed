@@ -149,7 +149,7 @@ impl DataSource for LazyIcebergDataSource {
                 Err(err) => Err(iceberg_err(err)),
             })
             .boxed();
-        self.scan.open(feed, partition, context)
+        self.scan.open(feed, &self.filters, partition, context)
     }
 
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {

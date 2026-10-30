@@ -1,10 +1,11 @@
+use crate::common::runtime_predicate::DynamicFilterPredicateProvider;
 use crate::{IcebergConfig, common::df_err};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, Statistics};
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::Partitioning;
+use datafusion::physical_expr::{Partitioning, PhysicalExpr};
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -27,21 +28,30 @@ pub(crate) struct ScanConfig {
 }
 
 impl ScanConfig {
+    /// Reads `tasks`. `filters` are the source's kept filters, against [`Self::schema`]; when
+    /// `iceberg.dynamic_filter_pruning_enabled` is set, the dynamic ones among them prune each
+    /// data file with their values at the time the reader starts it.
     pub(crate) fn open(
         &self,
         tasks: FileScanTaskStream,
+        filters: &[Arc<dyn PhysicalExpr>],
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let config = IcebergConfig::from_task_context(&context);
 
-        let reader =
+        let mut builder =
             ArrowReaderBuilder::new(self.iceberg_file_io.clone(), self.iceberg_runtime.clone())
                 .with_batch_size(context.session_config().batch_size())
                 .with_data_file_concurrency_limit(config.data_file_concurrency_limit)
                 .with_row_group_filtering_enabled(config.row_group_filtering_enabled)
-                .with_row_selection_enabled(config.row_selection_enabled)
-                .build();
+                .with_row_selection_enabled(config.row_selection_enabled);
+        if config.dynamic_filter_pruning_enabled
+            && let Some(provider) = DynamicFilterPredicateProvider::try_new(filters, &self.schema)
+        {
+            builder = builder.with_runtime_predicate_provider(Arc::new(provider));
+        }
+        let reader = builder.build();
 
         let stream = reader
             .read(tasks)

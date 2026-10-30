@@ -23,7 +23,6 @@ use iceberg::spec::{Datum, Schema, Type};
 ///
 /// The predicate matches a superset of the rows for which `expr` evaluates to `true`.
 /// Returns `None` when no part of `expr` can be expressed as a predicate.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn physical_expr_to_predicate(
     expr: &Arc<dyn PhysicalExpr>,
     input_schema: &ArrowSchema,

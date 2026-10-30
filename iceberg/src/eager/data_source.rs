@@ -167,7 +167,7 @@ impl DataSource for EagerIcebergDataSource {
                 Ok(source.files.tasks()[source.partitions[partition][offset]].clone())
             })
             .boxed();
-        self.scan.open(tasks, partition, context)
+        self.scan.open(tasks, &self.filters, partition, context)
     }
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
