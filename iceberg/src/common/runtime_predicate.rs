@@ -4,9 +4,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
-use datafusion::physical_expr::{PhysicalExpr, conjunction};
+use datafusion::physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 use datafusion::physical_expr_common::physical_expr::snapshot_generation;
 use iceberg::arrow::{RuntimePredicateProvider, RuntimePredicateSnapshot, arrow_schema_to_schema};
 use iceberg::spec::Schema;
@@ -39,8 +38,8 @@ pub(crate) struct DynamicFilterPredicateProvider {
 }
 
 impl DynamicFilterPredicateProvider {
-    /// Builds a provider over the dynamic filters found in `filters` (at the top level or nested
-    /// inside a kept expression), all expressed against `arrow_schema`, the scan's output schema.
+    /// Builds a provider over the dynamic filters among `filters` and their top-level AND
+    /// conjuncts, all expressed against `arrow_schema`, the scan's output schema.
     ///
     /// Returns `None` when there is no dynamic filter, or when the output schema can't be mapped
     /// back to Iceberg fields; the scan then reads without runtime pruning.
@@ -48,18 +47,14 @@ impl DynamicFilterPredicateProvider {
         filters: &[Arc<dyn PhysicalExpr>],
         arrow_schema: &SchemaRef,
     ) -> Option<Self> {
-        let mut dynamic = Vec::new();
-        for filter in filters {
-            filter
-                .apply(|expr| {
-                    if expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
-                        dynamic.push(Arc::clone(expr));
-                        return Ok(TreeNodeRecursion::Jump);
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })
-                .ok()?;
-        }
+        // Only conjuncts may be used: a dynamic filter under OR, NOT or any other expression
+        // doesn't restrict the rows the kept filter matches, so it is ignored (fail open).
+        let dynamic: Vec<_> = filters
+            .iter()
+            .flat_map(split_conjunction)
+            .filter(|expr| expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some())
+            .cloned()
+            .collect();
         if dynamic.is_empty() {
             return None;
         }
@@ -84,5 +79,106 @@ impl RuntimePredicateProvider for DynamicFilterPredicateProvider {
         let expr = conjunction(self.filters.iter().cloned());
         let predicate = physical_expr_to_predicate(&expr, &self.arrow_schema, &self.iceberg_schema);
         Ok(RuntimePredicateSnapshot::new(predicate, generation))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, NotExpr, col, lit};
+    use std::collections::HashMap;
+
+    #[test]
+    fn snapshot_follows_dynamic_filter_updates() {
+        let schema = id_schema();
+        let dynamic = id_dynamic_filter(&schema);
+        let provider = DynamicFilterPredicateProvider::try_new(
+            &[Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>],
+            &schema,
+        )
+        .expect("a kept dynamic filter installs a provider");
+        let before = provider.generation();
+        insta::assert_snapshot!(snapshot(&provider), @r#"generation=1, predicate=Some("TRUE")"#);
+
+        dynamic
+            .update(Arc::new(BinaryExpr::new(
+                col("id", &schema).unwrap(),
+                Operator::LtEq,
+                lit(10i64),
+            )))
+            .unwrap();
+
+        assert!(provider.generation() > before);
+        insta::assert_snapshot!(snapshot(&provider), @r#"generation=2, predicate=Some("id <= 10")"#);
+    }
+
+    #[test]
+    fn dynamic_filter_and_static_conjunct_are_used() {
+        let schema = id_schema();
+        let dynamic = id_dynamic_filter(&schema);
+        let filter = Arc::new(BinaryExpr::new(
+            dynamic,
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                col("id", &schema).unwrap(),
+                Operator::Gt,
+                lit(0i64),
+            )),
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(DynamicFilterPredicateProvider::try_new(&[filter], &schema).is_some());
+    }
+
+    #[test]
+    fn dynamic_filter_under_or_is_ignored() {
+        let schema = id_schema();
+        let dynamic = id_dynamic_filter(&schema);
+        let filter = Arc::new(BinaryExpr::new(
+            dynamic,
+            Operator::Or,
+            Arc::new(BinaryExpr::new(
+                col("id", &schema).unwrap(),
+                Operator::Gt,
+                lit(100i64),
+            )),
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(DynamicFilterPredicateProvider::try_new(&[filter], &schema).is_none());
+    }
+
+    #[test]
+    fn dynamic_filter_under_not_is_ignored() {
+        let schema = id_schema();
+        let filter = Arc::new(NotExpr::new(id_dynamic_filter(&schema))) as Arc<dyn PhysicalExpr>;
+
+        assert!(DynamicFilterPredicateProvider::try_new(&[filter], &schema).is_none());
+    }
+
+    /// A dynamic filter on `id`, starting as `true` like a hash join's placeholder.
+    fn id_dynamic_filter(schema: &SchemaRef) -> Arc<DynamicFilterPhysicalExpr> {
+        Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col("id", schema).unwrap()],
+            lit(true),
+        ))
+    }
+
+    /// An `id` column carrying its Iceberg field id, like a scan's output schema.
+    fn id_schema() -> SchemaRef {
+        let field = Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+            "PARQUET:field_id".to_string(),
+            "1".to_string(),
+        )]));
+        Arc::new(ArrowSchema::new(vec![field]))
+    }
+
+    fn snapshot(provider: &DynamicFilterPredicateProvider) -> String {
+        let snapshot = provider.snapshot().unwrap();
+        format!(
+            "generation={}, predicate={:?}",
+            snapshot.generation(),
+            snapshot.into_predicate().map(|p| p.to_string())
+        )
     }
 }
