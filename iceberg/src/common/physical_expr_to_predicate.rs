@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::Schema as ArrowSchema;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
@@ -17,20 +18,31 @@ use datafusion::physical_expr::expressions::{
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, Schema, Type};
 
-/// Converts `expr` into an Iceberg [`Predicate`] over the fields of `schema`.
+/// Converts `expr`, evaluated against `input_schema`, into an Iceberg [`Predicate`] over the
+/// fields of `schema`.
 ///
 /// The predicate matches a superset of the rows for which `expr` evaluates to `true`.
 /// Returns `None` when no part of `expr` can be expressed as a predicate.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn physical_expr_to_predicate(
     expr: &Arc<dyn PhysicalExpr>,
+    input_schema: &ArrowSchema,
     schema: &Schema,
 ) -> Option<Predicate> {
-    convert(expr, schema).map(|c| c.predicate)
+    let schemas = Schemas {
+        input: input_schema,
+        iceberg: schema,
+    };
+    convert(expr, &schemas).map(|c| c.predicate)
 }
 
 /// A converted subtree. `exact` is true when `predicate` matches exactly the rows the subtree
 /// evaluates to `true` (with the same NULL semantics), and false when it over-approximates.
+struct Schemas<'a> {
+    input: &'a ArrowSchema,
+    iceberg: &'a Schema,
+}
+
 struct Converted {
     predicate: Predicate,
     exact: bool,
@@ -45,7 +57,7 @@ impl Converted {
     }
 }
 
-fn convert(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<Converted> {
+fn convert(expr: &Arc<dyn PhysicalExpr>, schema: &Schemas) -> Option<Converted> {
     if let Some(dynamic) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
         return convert(&dynamic.current().ok()?, schema);
     }
@@ -82,7 +94,7 @@ fn convert(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<Converted> {
     None
 }
 
-fn convert_binary(binary: &BinaryExpr, schema: &Schema) -> Option<Converted> {
+fn convert_binary(binary: &BinaryExpr, schema: &Schemas) -> Option<Converted> {
     match binary.op() {
         Operator::And => {
             let left = convert(binary.left(), schema);
@@ -114,7 +126,7 @@ fn convert_comparison(
     left: &Arc<dyn PhysicalExpr>,
     op: Operator,
     right: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
+    schema: &Schemas,
 ) -> Option<Converted> {
     let (column, literal, op) = match (column_ref(left, schema), column_ref(right, schema)) {
         (Some(column), None) => (column, right, op),
@@ -135,7 +147,7 @@ fn convert_comparison(
     Some(Converted::exact(predicate))
 }
 
-fn convert_in_list(in_list: &InListExpr, schema: &Schema) -> Option<Converted> {
+fn convert_in_list(in_list: &InListExpr, schema: &Schemas) -> Option<Converted> {
     let (reference, field_type) = column_ref(in_list.expr(), schema)?;
     let mut datums = Vec::with_capacity(in_list.list().len());
     for item in in_list.list() {
@@ -164,10 +176,16 @@ fn convert_in_list(in_list: &InListExpr, schema: &Schema) -> Option<Converted> {
 /// resolve.
 fn column_ref<'a>(
     expr: &Arc<dyn PhysicalExpr>,
-    schema: &'a Schema,
+    schemas: &Schemas<'a>,
 ) -> Option<(Reference, &'a Type)> {
     let column = expr.downcast_ref::<Column>()?;
-    let field = schema.field_by_name(column.name())?;
+    // The column's index is what DataFusion evaluates; its name must agree with the input field
+    // at that index, otherwise the name can't be trusted to identify the Iceberg field.
+    let input_field = schemas.input.fields().get(column.index())?;
+    if input_field.name() != column.name() {
+        return None;
+    }
+    let field = schemas.iceberg.field_by_name(column.name())?;
     Some((Reference::new(column.name()), field.field_type.as_ref()))
 }
 
@@ -194,9 +212,10 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::Int16(Some(v)) => Datum::int(*v as i32),
         ScalarValue::Int32(Some(v)) => Datum::int(*v),
         ScalarValue::Int64(Some(v)) => Datum::long(*v),
-        // NaN ordering differs between engines; don't prune on it.
-        ScalarValue::Float32(Some(v)) if !v.is_nan() => Datum::float(*v),
-        ScalarValue::Float64(Some(v)) if !v.is_nan() => Datum::double(*v),
+        // NaN ordering differs between engines, and Iceberg may collapse +0.0 and -0.0 (e.g.
+        // in IN sets) where DataFusion distinguishes them; don't prune on either.
+        ScalarValue::Float32(Some(v)) if !v.is_nan() && *v != 0.0 => Datum::float(*v),
+        ScalarValue::Float64(Some(v)) if !v.is_nan() && *v != 0.0 => Datum::double(*v),
         ScalarValue::Utf8(Some(v))
         | ScalarValue::LargeUtf8(Some(v))
         | ScalarValue::Utf8View(Some(v)) => Datum::string(v.clone()),
@@ -217,7 +236,7 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use datafusion::physical_expr::expressions::{CaseExpr, CastExpr, lit};
     use iceberg::spec::{NestedField, PrimitiveType};
     use insta::assert_snapshot;
@@ -461,6 +480,43 @@ mod tests {
         assert_snapshot!(show(&dynamic, &schema), @"((id >= 10) AND (id <= 20)) AND (id IN (20, 15, 10))");
     }
 
+    #[test]
+    fn column_name_must_match_the_input_field_at_its_index() {
+        let schema = iceberg_schema();
+        // Named `id` but pointing at `small` (index 1), or past the end of the input schema.
+        let mismatched: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 1));
+        let out_of_range: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 99));
+        let results = [mismatched, out_of_range].map(|c| {
+            format!(
+                "{:?}",
+                convert_expr(&binary(c, Operator::Eq, lit(5i64)), &schema).map(|p| p.to_string())
+            )
+        });
+        assert_snapshot!(results.join("\n"), @"
+        None
+        None
+        ");
+    }
+
+    #[test]
+    fn float_zero_literals_do_not_convert() {
+        let schema = iceberg_schema();
+        // DataFusion distinguishes +0.0 and -0.0; Iceberg may not, so don't prune on zeros.
+        let results = [
+            in_list_on("price", &[lit(-0.0f64), lit(1.5f64)], false),
+            in_list_on("price", &[lit(0.0f64), lit(1.5f64)], true),
+            binary(col("price"), Operator::Eq, lit(-0.0f64)),
+            binary(col("price"), Operator::Gt, lit(0.0f64)),
+        ]
+        .map(|e| format!("{:?}", convert_expr(&e, &schema).map(|p| p.to_string())));
+        assert_snapshot!(results.join("\n"), @"
+        None
+        None
+        None
+        None
+        ");
+    }
+
     fn iceberg_schema() -> Schema {
         let field = |id, name, ty| NestedField::optional(id, name, Type::Primitive(ty)).into();
         Schema::builder()
@@ -481,11 +537,18 @@ mod tests {
         ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("small", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("price", DataType::Float64, true),
+            Field::new("day", DataType::Date32, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            // Present in the input but not in the Iceberg schema.
+            Field::new("missing", DataType::Int64, true),
         ])
     }
 
     fn convert_expr(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<Predicate> {
-        physical_expr_to_predicate(expr, schema)
+        physical_expr_to_predicate(expr, &arrow_schema(), schema)
     }
 
     fn show(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> String {
@@ -495,7 +558,9 @@ mod tests {
     }
 
     fn col(name: &str) -> Arc<dyn PhysicalExpr> {
-        let index = arrow_schema().index_of(name).unwrap_or(0);
+        let index = arrow_schema()
+            .index_of(name)
+            .expect("column in the input schema");
         Arc::new(Column::new(name, index))
     }
 
@@ -529,6 +594,16 @@ mod tests {
     }
 
     fn in_list(values: &[Arc<dyn PhysicalExpr>], negated: bool) -> Arc<dyn PhysicalExpr> {
-        Arc::new(InListExpr::try_new(col("id"), values.to_vec(), negated, &arrow_schema()).unwrap())
+        in_list_on("id", values, negated)
+    }
+
+    fn in_list_on(
+        column: &str,
+        values: &[Arc<dyn PhysicalExpr>],
+        negated: bool,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            InListExpr::try_new(col(column), values.to_vec(), negated, &arrow_schema()).unwrap(),
+        )
     }
 }
