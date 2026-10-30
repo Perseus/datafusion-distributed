@@ -89,6 +89,11 @@ impl PhysicalExtensionCodec for LazyIcebergCodec {
             .map(usize::try_from)
             .transpose()
             .map_err(|_| proto_error("Iceberg fetch limit does not fit in usize"))?;
+        let filters = proto
+            .filters
+            .iter()
+            .map(|filter| proto_converter.proto_to_physical_expr(filter, &schema, &decode_ctx))
+            .collect::<Result<Vec<_>>>()?;
         let iceberg_file_io = FileIOBuilder::new(Arc::clone(&self.storage_factory))
             .with_props(proto.storage_properties)
             .build();
@@ -105,7 +110,7 @@ impl PhysicalExtensionCodec for LazyIcebergCodec {
             column_stats: None,
             table_snapshot: None,
             feed,
-            filters: Vec::new(),
+            filters,
         }))
     }
 
@@ -138,6 +143,11 @@ impl PhysicalExtensionCodec for LazyIcebergCodec {
             )?),
             fetch: source.scan.fetch.map(|value| value as u64),
             storage_properties: source.scan.iceberg_file_io.config().props().clone(),
+            filters: source
+                .filters
+                .iter()
+                .map(|filter| proto_converter.physical_expr_to_proto(filter, self))
+                .collect::<Result<Vec<_>>>()?,
         };
         proto.encode(buf).map_err(|error| {
             proto_error(format!("failed to encode LazyIcebergDataSource: {error}"))

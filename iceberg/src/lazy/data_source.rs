@@ -154,15 +154,15 @@ impl DataSource for LazyIcebergDataSource {
 
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "format=iceberg")?;
-        let Some(feed) = self.feed.inner() else {
-            return Ok(());
-        };
-        write!(f, ", table={}", feed.iceberg_table.identifier())?;
-        if let Some(projection) = &feed.projection {
-            write!(f, ", projection=[{}]", projection.join(", "))?;
-        }
-        if let Some(predicate) = &feed.predicates {
-            write!(f, ", predicate={predicate}")?;
+        // Workers decode the source without its feed's table details.
+        if let Some(feed) = self.feed.inner() {
+            write!(f, ", table={}", feed.iceberg_table.identifier())?;
+            if let Some(projection) = &feed.projection {
+                write!(f, ", projection=[{}]", projection.join(", "))?;
+            }
+            if let Some(predicate) = &feed.predicates {
+                write!(f, ", predicate={predicate}")?;
+            }
         }
         if let Some(fetch) = self.scan.fetch {
             write!(f, ", fetch={fetch}")?;

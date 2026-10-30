@@ -7,6 +7,8 @@ message IcebergDataSource {
   DataFusionPartitioning partitioning = 3;
   optional uint64 fetch = 4;
   map<string, string> storage_properties = 5;
+  // Filters pushed down by parent operators, including dynamic filters.
+  repeated DataFusionPhysicalExpr filters = 6;
 }
 
 message WorkUnitFeed {
@@ -16,12 +18,15 @@ message WorkUnitFeed {
 // The generated Rust fields use DataFusion's canonical protobuf types.
 message DataFusionSchema {}
 message DataFusionPartitioning {}
+message DataFusionPhysicalExpr {}
 
 message ScanConfig {
   DataFusionSchema schema = 1;
   DataFusionPartitioning partitioning = 2;
   optional uint64 fetch = 3;
   map<string, string> storage_properties = 4;
+  // Filters pushed down by parent operators, including dynamic filters.
+  repeated DataFusionPhysicalExpr filters = 5;
 }
 message AssignedScan {
   ScanConfig config = 1;

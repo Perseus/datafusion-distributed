@@ -6,6 +6,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{Result, exec_datafusion_err, internal_err};
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::from_proto::parse_protobuf_partitioning;
 use datafusion_proto::physical_plan::to_proto::serialize_partitioning;
@@ -65,7 +66,7 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
         let source = pb::AssignedScan::decode(buf).map_err(|error| {
             proto_error(format!("failed to decode EagerIcebergDataSource: {error}"))
         })?;
-        let scan = self.decode_config(source.config, ctx, proto_converter)?;
+        let (scan, filters) = self.decode_config(source.config, ctx, proto_converter)?;
         if source.partitions.is_empty()
             || source.partitions.len() != scan.partitioning.partition_count()
         {
@@ -86,16 +87,16 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(DataSourceExec::from_data_source(
-            EagerIcebergDataSource::from_file_groups(
-                scan.schema,
-                groups,
-                scan.iceberg_file_io,
-                scan.iceberg_runtime,
-                scan.fetch,
-                ctx,
-            )?,
-        ))
+        let mut source = EagerIcebergDataSource::from_file_groups(
+            scan.schema,
+            groups,
+            scan.iceberg_file_io,
+            scan.iceberg_runtime,
+            scan.fetch,
+            ctx,
+        )?;
+        source.filters = filters;
+        Ok(DataSourceExec::from_data_source(source))
     }
 
     fn try_encode(
@@ -142,7 +143,7 @@ impl EagerIcebergCodec {
         proto: Option<pb::ScanConfig>,
         ctx: &TaskContext,
         proto_converter: &dyn PhysicalProtoConverterExtension,
-    ) -> Result<ScanConfig> {
+    ) -> Result<(ScanConfig, Vec<Arc<dyn PhysicalExpr>>)> {
         let proto = proto.ok_or_else(|| proto_error("Missing Iceberg scan config"))?;
         let schema = proto
             .schema
@@ -161,17 +162,23 @@ impl EagerIcebergCodec {
             .map(usize::try_from)
             .transpose()
             .map_err(|_| proto_error("Iceberg fetch limit does not fit in usize"))?;
+        let filters = proto
+            .filters
+            .iter()
+            .map(|filter| proto_converter.proto_to_physical_expr(filter, &schema, &decode_ctx))
+            .collect::<Result<Vec<_>>>()?;
         let iceberg_file_io = FileIOBuilder::new(Arc::clone(&self.storage_factory))
             .with_props(proto.storage_properties)
             .build();
-        Ok(ScanConfig {
+        let scan = ScanConfig {
             schema,
             partitioning,
             fetch,
             metrics: Default::default(),
             iceberg_file_io,
             iceberg_runtime: self.iceberg_runtime.clone(),
-        })
+        };
+        Ok((scan, filters))
     }
 
     fn encode_config(
@@ -190,6 +197,11 @@ impl EagerIcebergCodec {
             )?),
             fetch: source.fetch().map(|value| value as u64),
             storage_properties: source.file_io().config().props().clone(),
+            filters: source
+                .filters
+                .iter()
+                .map(|filter| proto_converter.physical_expr_to_proto(filter, self))
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 }

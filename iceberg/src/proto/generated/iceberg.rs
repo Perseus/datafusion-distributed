@@ -12,6 +12,9 @@ pub struct IcebergDataSource {
     #[prost(map = "string, string", tag = "5")]
     pub storage_properties:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Filters pushed down by parent operators, including dynamic filters.
+    #[prost(message, repeated, tag = "6")]
+    pub filters: ::prost::alloc::vec::Vec<::datafusion_proto::protobuf::PhysicalExprNode>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WorkUnitFeed {
@@ -29,6 +32,9 @@ pub struct ScanConfig {
     pub fetch: Option<u64>,
     #[prost(map = "string, string", tag = "4")]
     pub storage_properties: ::std::collections::HashMap<String, String>,
+    /// Filters pushed down by parent operators, including dynamic filters.
+    #[prost(message, repeated, tag = "5")]
+    pub filters: Vec<::datafusion_proto::protobuf::PhysicalExprNode>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AssignedScan {
