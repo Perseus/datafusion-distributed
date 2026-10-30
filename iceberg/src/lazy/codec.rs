@@ -105,6 +105,7 @@ impl PhysicalExtensionCodec for LazyIcebergCodec {
             column_stats: None,
             table_snapshot: None,
             feed,
+            filters: Vec::new(),
         }))
     }
 
