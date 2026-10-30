@@ -117,3 +117,14 @@ test-case = "3.3.1"
 [workspace.lints.clippy]
 disallowed_types = "deny"
 disallowed-methods = "deny"
+
+# Points every apache/iceberg-rust crate at a fork branch that adds the
+# execution-time predicate API from apache/iceberg-rust#3351 (not yet merged).
+# The branch is the same rev that datafusion-iceberg pins (5b82ab99) plus that
+# change, so the graph still has a single `iceberg` crate. Rebuild the branch
+# whenever that pin moves:
+# https://github.com/Perseus/iceberg-rust/tree/dfd/runtime-predicate-5b82ab9
+[patch."https://github.com/apache/iceberg-rust"]
+iceberg = { git = "https://github.com/Perseus/iceberg-rust", rev = "cbfab28d97d8621cd6e427152d75fe93e49f572d" }
+iceberg-property-macro = { git = "https://github.com/Perseus/iceberg-rust", rev = "cbfab28d97d8621cd6e427152d75fe93e49f572d" }
+iceberg-storage-opendal = { git = "https://github.com/Perseus/iceberg-rust", rev = "cbfab28d97d8621cd6e427152d75fe93e49f572d" }
