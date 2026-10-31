@@ -2,6 +2,7 @@
 mod tests {
     use std::sync::Arc;
 
+    use datafusion::common::exec_datafusion_err;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::error::Result;
@@ -11,8 +12,10 @@ mod tests {
     use datafusion_distributed::DistributedExt;
     use datafusion_distributed_iceberg::{IcebergExt, IcebergIntegrationOptions};
     use datafusion_distributed_iceberg_test_tools::{
-        CountingStorageFactory, IcebergTestHarness, create_taxi_table,
+        CountingStorageFactory, FixtureCatalog, FixtureTable, IcebergTestHarness, TAXI_DAYS,
+        create_taxi_table, taxi_schema, taxi_trips,
     };
+    use iceberg::TableIdent;
 
     /// Single node, so the join's build side is complete before the probe scan starts reading
     /// and the dynamic filter's value is known when every probe file opens. With pruning on,
@@ -319,6 +322,71 @@ mod tests {
         Ok(())
     }
 
+    /// The same partitioned join over a table that isn't partitioned, so no file can be
+    /// skipped by its partition values and every data file is read either way. The routing
+    /// `CASE` still prunes the row groups of the days no build partition holds, using their
+    /// column statistics.
+    #[tokio::test]
+    async fn lazy_scan_prunes_row_groups_with_partitioned_join_filter() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let off_run = run_partitioned_join(&off).await?;
+        let on_run = run_partitioned_join(&on).await?;
+
+        insta::assert_snapshot!(off_run.join_mode, @"Partitioned");
+        insta::assert_snapshot!(
+            format!("pruning off: {}\npruning on: {}", off_run.probe_rows, on_run.probe_rows),
+            @"
+        pruning off: 175000
+        pruning on: 50000
+        "
+        );
+        insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
+        data files read with pruning off: 9
+        data files read with pruning on: 9
+        ");
+        assert_eq!(off_run.result, on_run.result);
+        insta::assert_snapshot!(on_run.result, @"
+        +-------+
+        | trips |
+        +-------+
+        | 50000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
     /// Like [lazy_scan_prunes_with_partitioned_join_filter], for a scan whose files are planned
     /// eagerly.
     #[tokio::test]
@@ -463,6 +531,24 @@ mod tests {
             probe_rows,
             result: datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
         })
+    }
+
+    /// Table `default.taxi` with the taxi trips, one file (and row group) per day like
+    /// [create_taxi_table], but without a partition spec.
+    async fn create_unpartitioned_taxi_table() -> Result<FixtureTable> {
+        let ident =
+            TableIdent::from_strs(["default", "taxi"]).map_err(|e| exec_datafusion_err!("{e}"))?;
+        let mut table = FixtureCatalog::try_new()
+            .await?
+            .table(ident, taxi_schema())
+            .create()
+            .await?;
+        let mut append = table.append();
+        for day in 0..TAXI_DAYS {
+            append = append.file(taxi_trips(day)?);
+        }
+        append.commit().await?;
+        Ok(table)
     }
 
     /// Registers the Iceberg integration reading files through `storage`.

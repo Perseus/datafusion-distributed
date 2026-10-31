@@ -246,6 +246,10 @@ fn literal_to_scalar(
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{Field, Schema as ArrowSchema};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{
+        BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, lit,
+    };
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::spec::{DataFileFormat, NestedField, PartitionSpec, Schema, Struct};
 
@@ -387,6 +391,69 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn pruner_rebuilds_its_predicate_only_when_the_filter_changes() {
+        let schema = output_schema();
+        let day = |d: i32| lit(ScalarValue::Date32(Some(d)));
+        let day_col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("day", 1));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&day_col)],
+            lit(true),
+        ));
+        let pruner = PartitionFilePruner::try_new(&[Arc::clone(&dynamic) as _], &schema).unwrap();
+        let file = task(
+            spec(&[("day", Transform::Identity)]),
+            [Some(Literal::date(19732))],
+        );
+        let mut decisions = vec![format!(
+            "before any update: skip={}",
+            pruner.should_skip(&file)
+        )];
+
+        // A routing CASE whose only branch holds another day: the file can't match.
+        let routing: Arc<dyn PhysicalExpr> = Arc::new(
+            CaseExpr::try_new(
+                Some(Arc::clone(&day_col)),
+                vec![(
+                    day(19740),
+                    Arc::new(BinaryExpr::new(
+                        Arc::clone(&day_col),
+                        Operator::Eq,
+                        day(19740),
+                    )),
+                )],
+                Some(lit(false)),
+            )
+            .unwrap(),
+        );
+        dynamic.update(routing).unwrap();
+        let first = pruner.pruning_predicate().unwrap();
+        decisions.push(format!(
+            "after an update: skip={}",
+            pruner.should_skip(&file)
+        ));
+        // Same generation: the cached predicate is reused, not rebuilt.
+        assert!(Arc::ptr_eq(&first, &pruner.pruning_predicate().unwrap()));
+
+        dynamic
+            .update(Arc::new(BinaryExpr::new(
+                Arc::clone(&day_col),
+                Operator::Eq,
+                day(19732),
+            )))
+            .unwrap();
+        decisions.push(format!(
+            "after another update: skip={}",
+            pruner.should_skip(&file)
+        ));
+
+        insta::assert_snapshot!(decisions.join("\n"), @"
+        before any update: skip=false
+        after an update: skip=true
+        after another update: skip=false
+        ");
     }
 
     fn output_schema() -> SchemaRef {
