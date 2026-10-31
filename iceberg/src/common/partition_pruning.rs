@@ -10,17 +10,12 @@ use datafusion::common::pruning::{PrunableStatistics, PruningStatistics};
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion::physical_expr::{PhysicalExpr, conjunction};
-use datafusion::physical_expr_common::physical_expr::{
-    snapshot_generation, snapshot_physical_expr,
-};
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{Datum, Literal, PrimitiveLiteral, PrimitiveType, Transform, Type};
 use std::collections::{HashMap, HashSet};
 
-use crate::common::case_as_or::rewrite_case_as_or;
-use crate::common::runtime_predicate::dynamic_conjuncts;
+use crate::common::dynamic_domain::CompactedDynamicFilters;
 
 /// Decides, per data-file task, whether the scan's kept dynamic filters rule out every row of
 /// the file given its partition values and column bounds.
@@ -31,33 +26,26 @@ use crate::common::runtime_predicate::dynamic_conjuncts;
 /// The filters are read when the task is checked, never waited on, and are still applied by
 /// the `FilterExec` above the scan, so skipping only decides which files are read.
 ///
-/// Before building the predicate, the filters' current value goes through
-/// [`rewrite_case_as_or`], so a partitioned hash join's routing `CASE` can prune too.
-/// DataFusion's `FilePruner` snapshots the dynamic filters itself and can't take a rewritten
-/// value, so this uses [`PruningPredicate`] directly and reproduces its change tracking: the
-/// predicate is rebuilt only when the filters' generation changes.
+/// The predicate is built from the filters' compacted value, see [`CompactedDynamicFilters`],
+/// so a partitioned hash join's routing `CASE` can prune too. DataFusion's `FilePruner`
+/// snapshots the dynamic filters itself and can't take a rewritten value, so this uses
+/// [`PruningPredicate`] directly and reproduces its change tracking: the predicate is rebuilt
+/// only when the filters' generation changes.
 pub(crate) struct PartitionFilePruner {
-    predicate: Arc<dyn PhysicalExpr>,
+    filters: Arc<CompactedDynamicFilters>,
     schema: SchemaRef,
-    /// The pruning predicate built for a generation of `predicate`, `None` when it can't
-    /// prune.
+    /// The pruning predicate built for a generation of `filters`, `None` when it can't prune.
     cached: Mutex<Option<(u64, Option<Arc<PruningPredicate>>)>>,
 }
 
 impl PartitionFilePruner {
-    /// Builds a pruner over the dynamic filters among `filters` and their top-level AND
-    /// conjuncts, expressed against `schema`, the scan's output schema. Returns `None` when
-    /// there is no dynamic filter.
-    pub(crate) fn try_new(filters: &[Arc<dyn PhysicalExpr>], schema: &SchemaRef) -> Option<Self> {
-        let dynamic = dynamic_conjuncts(filters);
-        if dynamic.is_empty() {
-            return None;
-        }
-        Some(Self {
-            predicate: conjunction(dynamic),
+    /// Builds a pruner over `filters`, expressed against `schema`, the scan's output schema.
+    pub(crate) fn new(filters: Arc<CompactedDynamicFilters>, schema: &SchemaRef) -> Self {
+        Self {
+            filters,
             schema: Arc::clone(schema),
             cached: Mutex::new(None),
-        })
+        }
     }
 
     /// Whether `task`'s file can be skipped: `true` only if no row in it can pass the filters.
@@ -73,23 +61,19 @@ impl PartitionFilePruner {
     }
 
     /// The pruning predicate for the filters' current value, rebuilt only when their
-    /// generation changed since the last call. The generation is read before the value, so
-    /// the cached predicate is never older than its generation.
+    /// generation changed since the last call.
     fn pruning_predicate(&self) -> Option<Arc<PruningPredicate>> {
-        let generation = snapshot_generation(&self.predicate);
+        let generation = self.filters.generation();
         let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((cached_generation, predicate)) = cached.as_ref()
             && *cached_generation == generation
         {
             return predicate.clone();
         }
-        let predicate = snapshot_physical_expr(Arc::clone(&self.predicate))
-            .ok()
-            .and_then(|current| {
-                PruningPredicateBuilder::new()
-                    .with_file_schema(Arc::clone(&self.schema))
-                    .build(rewrite_case_as_or(&current))
-            });
+        let (generation, current) = self.filters.current();
+        let predicate = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&self.schema))
+            .build(current);
         *cached = Some((generation, predicate.clone()));
         predicate
     }
@@ -437,6 +421,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{Field, Schema as ArrowSchema};
     use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::{
         BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, lit,
     };
@@ -611,7 +596,7 @@ mod tests {
                 vec![Arc::clone(&name)],
                 Arc::new(BinaryExpr::new(Arc::clone(&name), Operator::Eq, lit(value))),
             ));
-            let pruner = PartitionFilePruner::try_new(&[filter as _], &output_schema()).unwrap();
+            let pruner = pruner(&[filter as _], &output_schema());
             format!("name = {value}: skip={}", pruner.should_skip(&task))
         };
 
@@ -790,7 +775,7 @@ mod tests {
             vec![Arc::clone(&day_col)],
             lit(true),
         ));
-        let pruner = PartitionFilePruner::try_new(&[Arc::clone(&dynamic) as _], &schema).unwrap();
+        let pruner = pruner(&[Arc::clone(&dynamic) as _], &schema);
         let file = task(
             spec(&[("day", Transform::Identity)]),
             [Some(Literal::date(19732))],
@@ -842,6 +827,12 @@ mod tests {
         after an update: skip=true
         after another update: skip=false
         ");
+    }
+
+    /// A pruner over the dynamic filters among `filters`, as a scan installs it.
+    fn pruner(filters: &[Arc<dyn PhysicalExpr>], schema: &SchemaRef) -> PartitionFilePruner {
+        let compacted = CompactedDynamicFilters::try_new(filters, schema, 150).unwrap();
+        PartitionFilePruner::new(Arc::new(compacted), schema)
     }
 
     fn output_schema() -> SchemaRef {

@@ -11,10 +11,10 @@
 //!   over-approximations still over-approximates. The result is approximate if any child is.
 //! * NOT, and negated IN, convert only exact children: negating an over-approximation would
 //!   under-approximate.
-//! * `CASE` converts as the OR of its THEN and ELSE branches (see
-//!   [`case_branches_disjunction`]) and is always approximate. This is the shape of a
-//!   partitioned hash join's dynamic filter, which routes each row to its build partition's
-//!   filter.
+//!
+//! Dynamic filters are compacted before they get here, see
+//! [`crate::common::dynamic_domain`], which is where a partitioned hash join's routing `CASE`
+//! is handled.
 
 use std::sync::Arc;
 
@@ -23,12 +23,11 @@ use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{
-    BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr,
-    Literal, NotExpr,
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr, Literal,
+    NotExpr,
 };
 use iceberg::expr::{Predicate, Reference};
 
-use crate::common::case_as_or::case_branches_disjunction;
 use iceberg::spec::{Datum, Schema, Type};
 
 /// Converts `expr`, evaluated against `input_schema`, into an Iceberg [`Predicate`] over the
@@ -75,14 +74,6 @@ fn convert(expr: &Arc<dyn PhysicalExpr>, schema: &Schemas) -> Option<Converted> 
     }
     if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         return convert_binary(binary, schema);
-    }
-    if let Some(case) = expr.downcast_ref::<CaseExpr>() {
-        // Any unconvertible branch makes the OR, and so the CASE, unconvertible.
-        let branches = convert(&case_branches_disjunction(case), schema)?;
-        return Some(Converted {
-            predicate: branches.predicate,
-            exact: false,
-        });
     }
     if let Some(not) = expr.downcast_ref::<NotExpr>() {
         // NOT of an over-approximation would under-approximate, so only exact children.
@@ -409,103 +400,6 @@ mod tests {
             binary(gt_id(9), Operator::And, cast_eq()),
         );
         assert!(convert_expr(&not(approximate_or), &schema).is_none());
-        // Same for a CASE, which always converts approximately.
-        let case = case(None, vec![(lit(true), lt_id(1))], None);
-        assert!(convert_expr(&not(case), &schema).is_none());
-    }
-
-    #[test]
-    fn hash_routed_case_converts_to_the_or_of_its_branches() {
-        let schema = iceberg_schema();
-        // DataFusion's partitioned-join filter: one branch per build partition, ELSE false.
-        let filter = case(
-            Some(binary(col("id"), Operator::Modulo, lit(2i64))),
-            vec![
-                (lit(0i64), partition_filter(10, 20, &[10, 20])),
-                (lit(1i64), partition_filter(31, 35, &[31, 35])),
-            ],
-            Some(lit(false)),
-        );
-        assert_snapshot!(show(&filter, &schema), @"(((id >= 10) AND (id <= 20)) AND (id IN (20, 10))) OR (((id >= 31) AND (id <= 35)) AND (id IN (31, 35)))");
-    }
-
-    #[test]
-    fn distributed_merge_of_per_task_case_filters_converts() {
-        let schema = iceberg_schema();
-        // In a distributed query the coordinator ORs together the filter each producer task
-        // built: here two tasks, each with its own routing CASE.
-        let task = |min, max| {
-            case(
-                Some(binary(col("id"), Operator::Modulo, lit(2i64))),
-                vec![(lit(0i64), partition_filter(min, max, &[min, max]))],
-                Some(lit(false)),
-            )
-        };
-        let merged = binary(task(10, 20), Operator::Or, task(31, 35));
-        assert_snapshot!(show(&merged, &schema), @"(((id >= 10) AND (id <= 20)) AND (id IN (20, 10))) OR (((id >= 31) AND (id <= 35)) AND (id IN (31, 35)))");
-    }
-
-    #[test]
-    fn range_routed_case_converts_to_the_or_of_its_branches_and_else() {
-        let schema = iceberg_schema();
-        // Range partitioning: the last partition's filter is the ELSE.
-        let filter = case(
-            Some(binary(col("id"), Operator::Divide, lit(100i64))),
-            vec![(lit(0u64), partition_filter(1, 5, &[1, 5]))],
-            Some(partition_filter(150, 160, &[150, 160])),
-        );
-        assert_snapshot!(show(&filter, &schema), @"(((id >= 1) AND (id <= 5)) AND (id IN (1, 5))) OR (((id >= 150) AND (id <= 160)) AND (id IN (160, 150)))");
-    }
-
-    #[test]
-    fn case_with_else_true_matches_everything() {
-        let schema = iceberg_schema();
-        // An ELSE true (a canceled build partition) means nothing can be pruned.
-        let filter = case(
-            Some(binary(col("id"), Operator::Modulo, lit(2i64))),
-            vec![(lit(0i64), partition_filter(10, 20, &[10, 20]))],
-            Some(lit(true)),
-        );
-        assert_snapshot!(show(&filter, &schema), @"TRUE");
-    }
-
-    #[test]
-    fn case_without_else_leaves_the_else_out() {
-        let schema = iceberg_schema();
-        // A missing ELSE yields NULL, which never passes a filter.
-        let filter = case(
-            None,
-            vec![(lit(true), lt_id(1)), (lit(false), gt_id(9))],
-            None,
-        );
-        assert_snapshot!(show(&filter, &schema), @"(id < 1) OR (id > 9)");
-    }
-
-    #[test]
-    fn case_with_an_unconvertible_branch_does_not_convert() {
-        let schema = iceberg_schema();
-        let filter = case(
-            Some(binary(col("id"), Operator::Modulo, lit(2i64))),
-            vec![(lit(0i64), lt_id(1)), (lit(1i64), cast_eq())],
-            Some(lit(false)),
-        );
-        assert!(convert_expr(&filter, &schema).is_none());
-    }
-
-    #[test]
-    fn case_with_probe_nulls_preserved_converts() {
-        let schema = iceberg_schema();
-        // A null-aware or null-equal join ORs `key IS NULL` around the routing CASE.
-        let routing = case(
-            Some(binary(col("id"), Operator::Modulo, lit(2i64))),
-            vec![
-                (lit(0i64), partition_filter(10, 20, &[10, 20])),
-                (lit(1i64), partition_filter(31, 35, &[31, 35])),
-            ],
-            Some(lit(false)),
-        );
-        let filter = binary(routing, Operator::Or, Arc::new(IsNullExpr::new(col("id"))));
-        assert_snapshot!(show(&filter, &schema), @"((((id >= 10) AND (id <= 20)) AND (id IN (20, 10))) OR (((id >= 31) AND (id <= 35)) AND (id IN (31, 35)))) OR (id IS NULL)");
     }
 
     #[test]
@@ -579,7 +473,7 @@ mod tests {
     #[test]
     fn hash_join_style_dynamic_filter() {
         let schema = iceberg_schema();
-        // Min/max bounds AND IN-list membership AND a CASE whose branches convert.
+        // Min/max bounds AND IN-list membership AND an unconvertible routing CASE, which is dropped.
         let bounds = binary(
             binary(col("id"), Operator::GtEq, lit(10i64)),
             Operator::And,
@@ -720,25 +614,6 @@ mod tests {
     /// An unconvertible leaf: `CAST(id AS INT) = 1`.
     fn cast_eq() -> Arc<dyn PhysicalExpr> {
         binary(cast_id(), Operator::Eq, lit(1i32))
-    }
-
-    fn case(
-        base: Option<Arc<dyn PhysicalExpr>>,
-        branches: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)>,
-        else_expr: Option<Arc<dyn PhysicalExpr>>,
-    ) -> Arc<dyn PhysicalExpr> {
-        Arc::new(CaseExpr::try_new(base, branches, else_expr).unwrap())
-    }
-
-    /// One build partition's filter: `id` bounds AND IN-list membership.
-    fn partition_filter(min: i64, max: i64, values: &[i64]) -> Arc<dyn PhysicalExpr> {
-        let bounds = binary(
-            binary(col("id"), Operator::GtEq, lit(min)),
-            Operator::And,
-            binary(col("id"), Operator::LtEq, lit(max)),
-        );
-        let values: Vec<_> = values.iter().map(|v| lit(*v)).collect();
-        binary(bounds, Operator::And, in_list(&values, false))
     }
 
     fn in_list(values: &[Arc<dyn PhysicalExpr>], negated: bool) -> Arc<dyn PhysicalExpr> {

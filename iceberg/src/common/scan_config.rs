@@ -1,3 +1,4 @@
+use crate::common::dynamic_domain::CompactedDynamicFilters;
 use crate::common::partition_pruning::PartitionFilePruner;
 use crate::common::runtime_predicate::DynamicFilterPredicateProvider;
 use crate::{IcebergConfig, common::df_err};
@@ -48,20 +49,39 @@ impl ScanConfig {
                 .with_data_file_concurrency_limit(config.data_file_concurrency_limit)
                 .with_row_group_filtering_enabled(config.row_group_filtering_enabled)
                 .with_row_selection_enabled(config.row_selection_enabled);
-        if config.dynamic_filter_pruning_enabled
-            && let Some(provider) = DynamicFilterPredicateProvider::try_new(filters, &self.schema)
+        // The dynamic filters are compacted once per change of their value and shared by the
+        // reader's runtime predicate and the file pruner. Value sets are capped like the IN
+        // lists DataFusion's hash join pushes down.
+        let compacted = config
+            .dynamic_filter_pruning_enabled
+            .then(|| {
+                let max_values = context
+                    .session_config()
+                    .options()
+                    .optimizer
+                    .hash_join_inlist_pushdown_max_distinct_values;
+                CompactedDynamicFilters::try_new(filters, &self.schema, max_values)
+            })
+            .flatten()
+            .map(Arc::new);
+        if let Some(compacted) = &compacted
+            && let Some(provider) =
+                DynamicFilterPredicateProvider::try_new(Arc::clone(compacted), &self.schema)
         {
             builder = builder.with_runtime_predicate_provider(Arc::new(provider));
         }
         let reader = builder.build();
 
-        let tasks = match PartitionFilePruner::try_new(filters, &self.schema) {
-            Some(pruner) if config.dynamic_filter_pruning_enabled => tasks
-                .filter(move |task| {
-                    future::ready(!task.as_ref().is_ok_and(|task| pruner.should_skip(task)))
-                })
-                .boxed(),
-            _ => tasks,
+        let tasks = match compacted {
+            Some(compacted) => {
+                let pruner = PartitionFilePruner::new(compacted, &self.schema);
+                tasks
+                    .filter(move |task| {
+                        future::ready(!task.as_ref().is_ok_and(|task| pruner.should_skip(task)))
+                    })
+                    .boxed()
+            }
+            None => tasks,
         };
 
         let stream = reader

@@ -1,0 +1,866 @@
+//! Compacts a scan's kept dynamic filters into one small per-column expression before they are
+//! used to prune, the way runtime filters are compacted into per-column domains.
+//!
+//! The filters DataFusion builds for joins can be large. A partitioned hash join routes each
+//! probe row to its build partition's filter with
+//! `CASE hash(keys) % N WHEN i THEN Fi ... ELSE false END`, a distributed query ORs one such
+//! filter per producer task, and every `Fi` holds its own bounds and IN list. Evaluated as
+//! written by a row filter, such a predicate costs O(rows × size).
+//!
+//! Instead, the filters' current value is normalized into a [`Domain`]: for each probe column,
+//! the non-null values that may pass (a range, or an exact value set that implies its range)
+//! and whether NULL may pass. The domain is then turned back into a small expression, see
+//! [`Domain::into_expr`], which both the runtime predicate and the file pruner use.
+//!
+//! # Conservative
+//!
+//! The domain of an expression contains every row for which the expression is `true`, and may
+//! contain more. Each rule only keeps or widens:
+//! * AND intersects the domains of its children. A child that can't be described (a hash
+//!   lookup, a cast, a NOT, ...) constrains nothing, which widens the result.
+//! * OR, and the branches of a `CASE`, union the domains of their children: the range spans
+//!   every branch, NULL passes if it passes any branch, a value set survives only if every
+//!   branch has one and the union stays within the cap, and a column unconstrained in any
+//!   branch is unconstrained. A `false` branch adds nothing; a `true` branch means no
+//!   constraint. Every row takes exactly one THEN branch or the ELSE of a `CASE`, so the
+//!   union of those branches covers every row the `CASE` keeps; the WHEN and base
+//!   expressions are ignored. A missing ELSE yields NULL, which never passes.
+//! * A multi-column constraint becomes one constraint per column, which is wider.
+//!
+//! Normalization therefore only ever widens, which is sound only where widening the
+//! expression widens the filter: it is applied to the dynamic filters that are top-level AND
+//! conjuncts of the scan's kept filters (see [`dynamic_conjuncts`]), never to one under NOT or
+//! any other expression, and within a filter it only descends through AND, OR and `CASE`
+//! branches, which are monotonic. The `FilterExec` above the scan still evaluates the original
+//! filters, so the domain only decides what is read, never which rows are returned.
+//!
+//! Literal handling matches [`physical_expr_to_predicate`]: a literal is used only when its type
+//! is exactly the column's, and float NaN and zero literals are not used, so float comparisons
+//! never depend on how NaN or the sign of zero is ordered.
+//!
+//! [`physical_expr_to_predicate`]: crate::common::physical_expr_to_predicate::physical_expr_to_predicate
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use datafusion::arrow::datatypes::Schema;
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::expressions::{
+    BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr,
+    Literal, in_list, lit,
+};
+use datafusion::physical_expr::{PhysicalExpr, conjunction, split_conjunction};
+use datafusion::physical_expr_common::physical_expr::{
+    snapshot_generation, snapshot_physical_expr,
+};
+
+/// A scan's kept dynamic filters, compacted with [`compact`] once per change of their value and
+/// shared by every consumer of the scan's filters.
+pub(crate) struct CompactedDynamicFilters {
+    /// The AND of the dynamic filters among the scan's top-level conjuncts.
+    filters: Arc<dyn PhysicalExpr>,
+    schema: Arc<Schema>,
+    max_values: usize,
+    /// The compacted expression for a generation of `filters`.
+    cached: Mutex<Option<(u64, Arc<dyn PhysicalExpr>)>>,
+}
+
+impl CompactedDynamicFilters {
+    /// Builds over the dynamic filters among `filters` and their top-level AND conjuncts,
+    /// expressed against `schema`, the scan's output schema. Value sets larger than
+    /// `max_values` are reduced to their range. Returns `None` when there is no dynamic filter.
+    pub(crate) fn try_new(
+        filters: &[Arc<dyn PhysicalExpr>],
+        schema: &Arc<Schema>,
+        max_values: usize,
+    ) -> Option<Self> {
+        let dynamic = dynamic_conjuncts(filters);
+        if dynamic.is_empty() {
+            return None;
+        }
+        Some(Self {
+            filters: conjunction(dynamic),
+            schema: Arc::clone(schema),
+            max_values,
+            cached: Mutex::new(None),
+        })
+    }
+
+    /// Changes whenever the dynamic filters are updated, and is never reused.
+    pub(crate) fn generation(&self) -> u64 {
+        snapshot_generation(&self.filters)
+    }
+
+    /// The compacted expression for the filters' current value, with the generation it was
+    /// built for. It is rebuilt only when the generation changed since the last call. The
+    /// generation is read before the value, so the expression is never older than its
+    /// generation.
+    pub(crate) fn current(&self) -> (u64, Arc<dyn PhysicalExpr>) {
+        let generation = self.generation();
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_generation, expr)) = cached.as_ref()
+            && *cached_generation == generation
+        {
+            return (generation, Arc::clone(expr));
+        }
+        let expr = match snapshot_physical_expr(Arc::clone(&self.filters)) {
+            Ok(current) => compact(&current, &self.schema, self.max_values),
+            // Fail open: no constraint.
+            Err(_) => lit(true),
+        };
+        *cached = Some((generation, Arc::clone(&expr)));
+        (generation, expr)
+    }
+}
+
+/// Returns the dynamic filters among `filters` and their top-level AND conjuncts.
+///
+/// Only conjuncts may be used for pruning: a dynamic filter under OR, NOT or any other
+/// expression doesn't restrict the rows the kept filter matches, so it is ignored (fail open).
+pub(crate) fn dynamic_conjuncts(filters: &[Arc<dyn PhysicalExpr>]) -> Vec<Arc<dyn PhysicalExpr>> {
+    filters
+        .iter()
+        .flat_map(split_conjunction)
+        .filter(|expr| expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some())
+        .cloned()
+        .collect()
+}
+
+/// Compacts `expr`, a snapshot of dynamic filters against `schema`, into an expression that is
+/// `true` for every row `expr` is `true` for: one constraint per column, see
+/// [`Domain::into_expr`]. Value sets larger than `max_values` are reduced to their range.
+///
+/// `expr` must be used where widening it is safe, see the module documentation.
+pub(crate) fn compact(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    max_values: usize,
+) -> Arc<dyn PhysicalExpr> {
+    let compactor = Compactor { schema, max_values };
+    compactor.domain(expr).into_expr(schema)
+}
+
+/// The rows that may pass a filter, as a constraint per column. A column absent from the map is
+/// unconstrained.
+#[derive(Debug, Clone)]
+enum Domain {
+    /// No row passes.
+    None,
+    Columns(BTreeMap<(usize, String), ColumnDomain>),
+}
+
+/// The values of one column that may pass.
+#[derive(Debug, Clone)]
+struct ColumnDomain {
+    column: Column,
+    values: Values,
+    /// Whether NULL may pass.
+    nulls: bool,
+}
+
+/// The non-null values that may pass.
+#[derive(Debug, Clone)]
+enum Values {
+    /// Exactly these values, sorted and distinct. Empty means no non-null value passes.
+    Set(Vec<ScalarValue>),
+    /// The values within these inclusive bounds; a missing bound is unbounded.
+    Range {
+        min: Option<ScalarValue>,
+        max: Option<ScalarValue>,
+    },
+}
+
+impl Domain {
+    fn all() -> Self {
+        Self::Columns(BTreeMap::new())
+    }
+
+    fn column(domain: ColumnDomain) -> Self {
+        let key = (domain.column.index(), domain.column.name().to_string());
+        Self::Columns(BTreeMap::from([(key, domain)])).normalized()
+    }
+
+    /// Drops unconstrained columns, and becomes [`Domain::None`] if a column admits nothing.
+    fn normalized(self) -> Self {
+        let Self::Columns(mut columns) = self else {
+            return self;
+        };
+        if columns.values().any(ColumnDomain::is_empty) {
+            return Self::None;
+        }
+        columns.retain(|_, domain| !domain.is_unconstrained());
+        Self::Columns(columns)
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        let (Self::Columns(mut left), Self::Columns(right)) = (self, other) else {
+            return Self::None;
+        };
+        for (key, domain) in right {
+            let merged = match left.remove(&key) {
+                Some(existing) => existing.intersect(domain),
+                None => domain,
+            };
+            left.insert(key, merged);
+        }
+        Self::Columns(left).normalized()
+    }
+
+    fn union(self, other: Self, max_values: usize) -> Self {
+        let (mut left, right) = match (self, other) {
+            (Self::None, other) | (other, Self::None) => return other,
+            (Self::Columns(left), Self::Columns(right)) => (left, right),
+        };
+        // Only columns constrained in both branches stay constrained.
+        let mut right = right;
+        left.retain(|key, _| right.contains_key(key));
+        let columns = left
+            .into_iter()
+            .map(|(key, domain)| {
+                let other = right.remove(&key).expect("kept keys are in both");
+                (key, domain.union(other, max_values))
+            })
+            .collect();
+        Self::Columns(columns).normalized()
+    }
+
+    /// For each constrained column `col`, `col >= min AND col <= max [AND col IN (set)]`, or
+    /// `col = v` for a single value, with `OR col IS NULL` when NULL may pass, AND-ed across
+    /// columns. A set's range is its smallest and largest value.
+    fn into_expr(self, schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        match self {
+            Self::None => lit(false),
+            Self::Columns(columns) => {
+                conjunction(columns.into_values().map(|domain| domain.into_expr(schema)))
+            }
+        }
+    }
+}
+
+impl ColumnDomain {
+    fn is_empty(&self) -> bool {
+        !self.nulls && matches!(&self.values, Values::Set(values) if values.is_empty())
+    }
+
+    fn is_unconstrained(&self) -> bool {
+        self.nulls
+            && matches!(
+                &self.values,
+                Values::Range {
+                    min: None,
+                    max: None
+                }
+            )
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            column: self.column,
+            values: self.values.intersect(other.values),
+            nulls: self.nulls && other.nulls,
+        }
+    }
+
+    fn union(self, other: Self, max_values: usize) -> Self {
+        Self {
+            column: self.column,
+            values: self.values.union(other.values, max_values),
+            nulls: self.nulls || other.nulls,
+        }
+    }
+
+    fn into_expr(self, schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        let column: Arc<dyn PhysicalExpr> = Arc::new(self.column);
+        let compare = |op, value: ScalarValue| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(Arc::clone(&column), op, lit(value)))
+        };
+        let non_null: Option<Arc<dyn PhysicalExpr>> = match self.values {
+            Values::Set(values) => match values.as_slice() {
+                [] => None,
+                [value] => Some(compare(Operator::Eq, value.clone())),
+                [first, .., last] => {
+                    let range = [
+                        compare(Operator::GtEq, first.clone()),
+                        compare(Operator::LtEq, last.clone()),
+                    ];
+                    let list = values.iter().cloned().map(lit).collect();
+                    // Building the IN list only fails on mismatched types; the range alone
+                    // still holds every value.
+                    let set = in_list(Arc::clone(&column), list, &false, schema).ok();
+                    Some(conjunction(range.into_iter().chain(set)))
+                }
+            },
+            Values::Range { min, max } => {
+                let bounds: Vec<_> = min
+                    .map(|min| compare(Operator::GtEq, min))
+                    .into_iter()
+                    .chain(max.map(|max| compare(Operator::LtEq, max)))
+                    .collect();
+                Some(if bounds.is_empty() {
+                    Arc::new(IsNotNullExpr::new(Arc::clone(&column)))
+                } else {
+                    conjunction(bounds)
+                })
+            }
+        };
+        let is_null =
+            || -> Arc<dyn PhysicalExpr> { Arc::new(IsNullExpr::new(Arc::clone(&column))) };
+        match (non_null, self.nulls) {
+            (Some(non_null), true) => Arc::new(BinaryExpr::new(non_null, Operator::Or, is_null())),
+            (Some(non_null), false) => non_null,
+            (None, true) => is_null(),
+            // Empty domains are normalized to `Domain::None`.
+            (None, false) => lit(false),
+        }
+    }
+}
+
+impl Values {
+    fn any() -> Self {
+        Self::Range {
+            min: None,
+            max: None,
+        }
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Set(left), Self::Set(right)) => {
+                Self::Set(left.into_iter().filter(|v| right.contains(v)).collect())
+            }
+            (Self::Set(values), Self::Range { min, max })
+            | (Self::Range { min, max }, Self::Set(values)) => Self::Set(
+                values
+                    .into_iter()
+                    .filter(|v| within(v, min.as_ref(), max.as_ref()))
+                    .collect(),
+            ),
+            (
+                Self::Range {
+                    min: min_a,
+                    max: max_a,
+                },
+                Self::Range {
+                    min: min_b,
+                    max: max_b,
+                },
+            ) => {
+                // Keeping either bound when they can't be compared only widens.
+                let min = tighter(min_a, min_b, Ordering::Greater);
+                let max = tighter(max_a, max_b, Ordering::Less);
+                match (&min, &max) {
+                    (Some(lo), Some(hi)) if lo.partial_cmp(hi) == Some(Ordering::Greater) => {
+                        Self::Set(Vec::new())
+                    }
+                    _ => Self::Range { min, max },
+                }
+            }
+        }
+    }
+
+    fn union(self, other: Self, max_values: usize) -> Self {
+        match (self, other) {
+            (Self::Set(empty), other) | (other, Self::Set(empty)) if empty.is_empty() => other,
+            (Self::Set(left), Self::Set(right)) => {
+                let merged = sorted_distinct(left.into_iter().chain(right).collect());
+                if merged.len() <= max_values {
+                    Self::Set(merged)
+                } else {
+                    Self::Set(merged).into_range()
+                }
+            }
+            (left, right) => match (left.into_range(), right.into_range()) {
+                (
+                    Self::Range {
+                        min: min_a,
+                        max: max_a,
+                    },
+                    Self::Range {
+                        min: min_b,
+                        max: max_b,
+                    },
+                ) => Self::Range {
+                    min: wider(min_a, min_b, Ordering::Less),
+                    max: wider(max_a, max_b, Ordering::Greater),
+                },
+                _ => Self::any(),
+            },
+        }
+    }
+
+    /// The range of a non-empty set, from its smallest to its largest value.
+    fn into_range(self) -> Self {
+        match self {
+            Self::Set(values) => Self::Range {
+                min: values.first().cloned(),
+                max: values.last().cloned(),
+            },
+            range => range,
+        }
+    }
+}
+
+/// Of two bounds, the one further in `direction`; a missing bound is unbounded and loses.
+fn tighter(
+    a: Option<ScalarValue>,
+    b: Option<ScalarValue>,
+    direction: Ordering,
+) -> Option<ScalarValue> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.partial_cmp(&a) == Some(direction) {
+            b
+        } else {
+            a
+        }),
+        (a, None) | (None, a) => a,
+    }
+}
+
+/// Of two bounds, the one further in `direction`; a missing bound is unbounded and wins, and so
+/// do bounds that can't be compared.
+fn wider(
+    a: Option<ScalarValue>,
+    b: Option<ScalarValue>,
+    direction: Ordering,
+) -> Option<ScalarValue> {
+    let (a, b) = (a?, b?);
+    match b.partial_cmp(&a)? {
+        ordering if ordering == direction => Some(b),
+        _ => Some(a),
+    }
+}
+
+/// Whether `value` is within the inclusive bounds. Values that can't be compared are kept.
+fn within(value: &ScalarValue, min: Option<&ScalarValue>, max: Option<&ScalarValue>) -> bool {
+    let below = min.is_some_and(|min| value.partial_cmp(min) == Some(Ordering::Less));
+    let above = max.is_some_and(|max| value.partial_cmp(max) == Some(Ordering::Greater));
+    !below && !above
+}
+
+fn sorted_distinct(mut values: Vec<ScalarValue>) -> Vec<ScalarValue> {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    values.dedup();
+    values
+}
+
+struct Compactor<'a> {
+    schema: &'a Schema,
+    max_values: usize,
+}
+
+impl Compactor<'_> {
+    fn domain(&self, expr: &Arc<dyn PhysicalExpr>) -> Domain {
+        if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+            return match binary.op() {
+                Operator::And => self
+                    .domain(binary.left())
+                    .intersect(self.domain(binary.right())),
+                Operator::Or => self
+                    .domain(binary.left())
+                    .union(self.domain(binary.right()), self.max_values),
+                op => self.comparison(binary.left(), *op, binary.right()),
+            };
+        }
+        if let Some(case) = expr.downcast_ref::<CaseExpr>() {
+            return case
+                .when_then_expr()
+                .iter()
+                .map(|(_, then)| then)
+                .chain(case.else_expr())
+                .map(|branch| self.domain(branch))
+                .fold(Domain::None, |acc, branch| {
+                    acc.union(branch, self.max_values)
+                });
+        }
+        if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
+            return self.in_list(in_list);
+        }
+        if let Some(is_null) = expr.downcast_ref::<IsNullExpr>()
+            && let Some(column) = self.column(is_null.arg())
+        {
+            return Domain::column(ColumnDomain {
+                column: column.clone(),
+                values: Values::Set(Vec::new()),
+                nulls: true,
+            });
+        }
+        if let Some(is_not_null) = expr.downcast_ref::<IsNotNullExpr>()
+            && let Some(column) = self.column(is_not_null.arg())
+        {
+            return Domain::column(ColumnDomain {
+                column: column.clone(),
+                values: Values::any(),
+                nulls: false,
+            });
+        }
+        if let Some(literal) = expr.downcast_ref::<Literal>() {
+            return match literal.value() {
+                ScalarValue::Boolean(Some(true)) => Domain::all(),
+                // `false` and NULL never pass.
+                ScalarValue::Boolean(_) | ScalarValue::Null => Domain::None,
+                _ => Domain::all(),
+            };
+        }
+        // Anything else (hash lookups, casts, NOT, ...) constrains nothing.
+        Domain::all()
+    }
+
+    fn comparison(
+        &self,
+        left: &Arc<dyn PhysicalExpr>,
+        op: Operator,
+        right: &Arc<dyn PhysicalExpr>,
+    ) -> Domain {
+        let (column, literal, op) = match (self.column(left), self.column(right)) {
+            (Some(column), None) => (column, right, op),
+            (None, Some(column)) => match op.swap() {
+                Some(op) => (column, left, op),
+                None => return Domain::all(),
+            },
+            _ => return Domain::all(),
+        };
+        let Some(value) = self.literal(column, literal) else {
+            return Domain::all();
+        };
+        // Strict bounds are kept inclusive, which only widens.
+        let values = match op {
+            Operator::Eq => Values::Set(vec![value]),
+            Operator::Lt | Operator::LtEq => Values::Range {
+                min: None,
+                max: Some(value),
+            },
+            Operator::Gt | Operator::GtEq => Values::Range {
+                min: Some(value),
+                max: None,
+            },
+            _ => return Domain::all(),
+        };
+        Domain::column(ColumnDomain {
+            column: column.clone(),
+            values,
+            nulls: false,
+        })
+    }
+
+    fn in_list(&self, in_list: &InListExpr) -> Domain {
+        let Some(column) = self.column(in_list.expr()) else {
+            return Domain::all();
+        };
+        if in_list.negated() {
+            return Domain::all();
+        }
+        let mut values = Vec::with_capacity(in_list.list().len());
+        for item in in_list.list() {
+            // A NULL item never matches. Any other unusable item makes the set unknown:
+            // leaving it out would narrow the set.
+            if item
+                .downcast_ref::<Literal>()
+                .is_some_and(|l| l.value().is_null())
+            {
+                continue;
+            }
+            match self.literal(column, item) {
+                Some(value) => values.push(value),
+                None => return Domain::all(),
+            }
+        }
+        let values = Values::Set(sorted_distinct(values));
+        let values = match &values {
+            Values::Set(set) if set.len() > self.max_values => values.into_range(),
+            _ => values,
+        };
+        Domain::column(ColumnDomain {
+            column: column.clone(),
+            values,
+            nulls: false,
+        })
+    }
+
+    /// A bare column whose name agrees with the input field at its index.
+    fn column<'e>(&self, expr: &'e Arc<dyn PhysicalExpr>) -> Option<&'e Column> {
+        let column = expr.downcast_ref::<Column>()?;
+        let field = self.schema.fields().get(column.index())?;
+        (field.name() == column.name()).then_some(column)
+    }
+
+    /// A non-null literal of exactly `column`'s type. Float NaN and zeros are not used, as in
+    /// [`physical_expr_to_predicate`](crate::common::physical_expr_to_predicate).
+    fn literal(&self, column: &Column, expr: &Arc<dyn PhysicalExpr>) -> Option<ScalarValue> {
+        let value = expr.downcast_ref::<Literal>()?.value();
+        if value.is_null() || &value.data_type() != self.schema.field(column.index()).data_type() {
+            return None;
+        }
+        match value {
+            ScalarValue::Float16(_) => None,
+            ScalarValue::Float32(Some(v)) if v.is_nan() || *v == 0.0 => None,
+            ScalarValue::Float64(Some(v)) if v.is_nan() || *v == 0.0 => None,
+            value => Some(value.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::physical_expr::expressions::{CastExpr, NotExpr};
+    use insta::assert_snapshot;
+
+    /// DataFusion's partitioned-join filter: one branch per build partition, ELSE false.
+    #[test]
+    fn hash_routed_case_unions_ranges_and_value_sets() {
+        let filter = hash_case(
+            vec![
+                partition_filter("id", 10, 20, &[10, 15, 20]),
+                partition_filter("id", 31, 35, &[31, 35]),
+            ],
+            lit(false),
+        );
+        assert_snapshot!(show(&filter, 150), @"id@0 >= 10 AND id@0 <= 35 AND id@0 IN (SET) ([10, 15, 20, 31, 35])");
+    }
+
+    #[test]
+    fn union_over_the_cap_keeps_only_the_range() {
+        let filter = hash_case(
+            vec![
+                partition_filter("id", 10, 20, &[10, 15, 20]),
+                partition_filter("id", 31, 35, &[31, 35]),
+            ],
+            lit(false),
+        );
+        assert_snapshot!(show(&filter, 4), @"id@0 >= 10 AND id@0 <= 35");
+    }
+
+    /// A build partition too large for an IN list probes a hash table instead, which can't be
+    /// described: that branch has bounds only, so the union keeps only the range.
+    #[test]
+    fn branch_without_a_value_set_keeps_only_the_range() {
+        let lookup_branch = binary(bounds("id", 100, 900), Operator::And, hash_lookup());
+        let filter = hash_case(
+            vec![partition_filter("id", 10, 20, &[10, 20]), lookup_branch],
+            lit(false),
+        );
+        assert_snapshot!(show(&filter, 150), @"id@0 >= 10 AND id@0 <= 900");
+    }
+
+    /// An ELSE true (a canceled build partition) lets every row through.
+    #[test]
+    fn else_true_constrains_nothing() {
+        let filter = hash_case(vec![partition_filter("id", 10, 20, &[10, 20])], lit(true));
+        assert_snapshot!(show(&filter, 150), @"true");
+    }
+
+    /// Range partitioning: the last partition's filter is the ELSE.
+    #[test]
+    fn range_routed_case_unions_its_branches_and_else() {
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(
+            CaseExpr::try_new(
+                Some(binary(col("id"), Operator::Divide, lit(100i64))),
+                vec![(lit(0i64), partition_filter("id", 1, 5, &[1, 5]))],
+                Some(partition_filter("id", 150, 160, &[150, 160])),
+            )
+            .unwrap(),
+        );
+        assert_snapshot!(show(&filter, 150), @"id@0 >= 1 AND id@0 <= 160 AND id@0 IN (SET) ([1, 5, 150, 160])");
+    }
+
+    /// In a distributed query the coordinator ORs together the filter each producer task built,
+    /// each with its own routing CASE.
+    #[test]
+    fn merged_per_task_cases_union_into_one_domain() {
+        let task = |min, max| {
+            hash_case(
+                vec![partition_filter("id", min, max, &[min, max]), lit(false)],
+                lit(false),
+            )
+        };
+        let merged = binary(task(10, 20), Operator::Or, task(31, 35));
+        assert_snapshot!(show(&merged, 150), @"id@0 >= 10 AND id@0 <= 35 AND id@0 IN (SET) ([10, 20, 31, 35])");
+    }
+
+    /// A multi-column join key: each column is constrained on its own, which is wider than the
+    /// tuples but holds them all.
+    #[test]
+    fn multi_column_keys_are_constrained_per_column() {
+        let branch = |id: (i64, i64), small: (i32, i32)| {
+            let small_bounds = binary(
+                binary(col("small"), Operator::GtEq, lit(small.0)),
+                Operator::And,
+                binary(col("small"), Operator::LtEq, lit(small.1)),
+            );
+            binary(bounds("id", id.0, id.1), Operator::And, small_bounds)
+        };
+        let filter = hash_case(
+            vec![branch((1, 5), (7, 9)), branch((3, 8), (2, 4))],
+            lit(false),
+        );
+        assert_snapshot!(show(&filter, 150), @"id@0 >= 1 AND id@0 <= 8 AND small@1 >= 2 AND small@1 <= 9");
+    }
+
+    /// A null-aware join ORs `key IS NULL` around its filter.
+    #[test]
+    fn null_admitting_filter_keeps_nulls() {
+        let routing = hash_case(
+            vec![
+                partition_filter("id", 10, 20, &[10, 20]),
+                partition_filter("id", 31, 35, &[31, 35]),
+            ],
+            lit(false),
+        );
+        let filter = binary(routing, Operator::Or, Arc::new(IsNullExpr::new(col("id"))));
+        assert_snapshot!(show(&filter, 150), @"id@0 >= 10 AND id@0 <= 35 AND id@0 IN (SET) ([10, 20, 31, 35]) OR id@0 IS NULL");
+    }
+
+    /// AND intersects: bounds narrow the value set, and the range follows the set.
+    #[test]
+    fn and_intersects_ranges_and_value_sets() {
+        let filter = binary(
+            binary(bounds("id", 0, 30), Operator::And, bounds("id", 12, 100)),
+            Operator::And,
+            in_list("id", &[5, 12, 18, 25, 40]),
+        );
+        assert_snapshot!(show(&filter, 150), @"id@0 >= 12 AND id@0 <= 25 AND id@0 IN (SET) ([12, 18, 25])");
+        let disjoint = binary(bounds("id", 0, 10), Operator::And, bounds("id", 20, 30));
+        assert_snapshot!(show(&disjoint, 150), @"false");
+    }
+
+    /// Hash lookups, casts and NOT can't be described, so they are dropped from an AND.
+    #[test]
+    fn unconvertible_conjuncts_are_dropped() {
+        let cast_eq = binary(
+            Arc::new(CastExpr::new(col("id"), DataType::Int32, None)),
+            Operator::Eq,
+            lit(1i32),
+        );
+        let not_small = Arc::new(NotExpr::new(binary(col("small"), Operator::Gt, lit(3i32))));
+        let filter = binary(
+            binary(bounds("id", 10, 20), Operator::And, cast_eq),
+            Operator::And,
+            binary(hash_lookup(), Operator::And, not_small),
+        );
+        assert_snapshot!(show(&filter, 150), @"id@0 >= 10 AND id@0 <= 20");
+    }
+
+    /// Literals follow the predicate conversion's rules: no other types, no float NaN or zeros.
+    /// An IN list with one such item is not used at all, since dropping the item would narrow it.
+    #[test]
+    fn unusable_literals_constrain_nothing() {
+        let filter = binary(
+            binary(col("small"), Operator::Gt, lit(3i64)),
+            Operator::And,
+            binary(
+                binary(col("price"), Operator::LtEq, lit(0.0f64)),
+                Operator::And,
+                Arc::new(
+                    InListExpr::try_new(
+                        col("price"),
+                        vec![lit(1.5f64), lit(f64::NAN)],
+                        false,
+                        &schema(),
+                    )
+                    .unwrap(),
+                ),
+            ),
+        );
+        assert_snapshot!(show(&filter, 150), @"true");
+    }
+
+    #[test]
+    fn dynamic_filters_under_not_or_or_are_not_selected() {
+        let dynamic: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col("id")],
+            bounds("id", 1, 2),
+        ));
+        let under_not: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(Arc::clone(&dynamic)));
+        let under_or = binary(Arc::clone(&dynamic), Operator::Or, lit(true));
+        let schema = Arc::new(schema());
+        assert!(CompactedDynamicFilters::try_new(&[under_not, under_or], &schema, 150).is_none());
+        let kept = binary(Arc::clone(&dynamic), Operator::And, bounds("small", 0, 1));
+        assert!(CompactedDynamicFilters::try_new(&[kept], &schema, 150).is_some());
+    }
+
+    #[test]
+    fn compacts_once_per_generation() {
+        let schema = Arc::new(schema());
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![col("id")], lit(true)));
+        let compacted =
+            CompactedDynamicFilters::try_new(&[Arc::clone(&dynamic) as _], &schema, 150).unwrap();
+        let (_, first) = compacted.current();
+        assert!(Arc::ptr_eq(&first, &compacted.current().1));
+        dynamic.update(bounds("id", 1, 2)).unwrap();
+        let (_, second) = compacted.current();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_snapshot!(second, @"id@0 >= 1 AND id@0 <= 2");
+    }
+
+    fn show(expr: &Arc<dyn PhysicalExpr>, max_values: usize) -> String {
+        compact(expr, &schema(), max_values).to_string()
+    }
+
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("small", DataType::Int32, true),
+            Field::new("price", DataType::Float64, true),
+        ])
+    }
+
+    fn col(name: &str) -> Arc<dyn PhysicalExpr> {
+        Arc::new(Column::new(name, schema().index_of(name).unwrap()))
+    }
+
+    fn binary(
+        l: Arc<dyn PhysicalExpr>,
+        op: Operator,
+        r: Arc<dyn PhysicalExpr>,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(l, op, r))
+    }
+
+    fn bounds(column: &str, min: i64, max: i64) -> Arc<dyn PhysicalExpr> {
+        binary(
+            binary(col(column), Operator::GtEq, lit(min)),
+            Operator::And,
+            binary(col(column), Operator::LtEq, lit(max)),
+        )
+    }
+
+    fn in_list(column: &str, values: &[i64]) -> Arc<dyn PhysicalExpr> {
+        let list = values.iter().map(|v| lit(*v)).collect();
+        Arc::new(InListExpr::try_new(col(column), list, false, &schema()).unwrap())
+    }
+
+    /// One build partition's filter: bounds AND IN-list membership.
+    fn partition_filter(column: &str, min: i64, max: i64, values: &[i64]) -> Arc<dyn PhysicalExpr> {
+        binary(
+            bounds(column, min, max),
+            Operator::And,
+            in_list(column, values),
+        )
+    }
+
+    /// `CASE id % N WHEN 0 THEN branches[0] ... ELSE else_expr END`.
+    fn hash_case(
+        branches: Vec<Arc<dyn PhysicalExpr>>,
+        else_expr: Arc<dyn PhysicalExpr>,
+    ) -> Arc<dyn PhysicalExpr> {
+        let routing = binary(col("id"), Operator::Modulo, lit(branches.len() as i64));
+        let when_then = branches
+            .into_iter()
+            .enumerate()
+            .map(|(i, then)| (lit(i as i64), then))
+            .collect();
+        Arc::new(CaseExpr::try_new(Some(routing), when_then, Some(else_expr)).unwrap())
+    }
+
+    /// Stands in for a hash table lookup, which can't be described: `CAST(id AS INT) = 1`.
+    fn hash_lookup() -> Arc<dyn PhysicalExpr> {
+        binary(
+            Arc::new(CastExpr::new(col("id"), DataType::Int32, None)),
+            Operator::Eq,
+            lit(1i32),
+        )
+    }
+}
