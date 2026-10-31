@@ -1,0 +1,160 @@
+# Benchmark-only workflow: Iceberg dynamic-filter pruning on vs off, interleaved on one runner.
+# Lives only on the bench/iceberg-dyn-filter-pruning branch.
+name: iceberg-pruning-bench
+
+on:
+  push:
+    branches: [bench/iceberg-dyn-filter-pruning]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "smoke (SF1, 1 round) or full (SF10)"
+        default: full
+        type: choice
+        options: [smoke, full]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iceberg-pruning-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: e10c4a5
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      sf: ${{ steps.p.outputs.sf }}
+      fr: ${{ steps.p.outputs.fr }}
+      fi: ${{ steps.p.outputs.fi }}
+      sr: ${{ steps.p.outputs.sr }}
+      si: ${{ steps.p.outputs.si }}
+      rs: ${{ steps.p.outputs.rs }}
+      replicas: ${{ steps.p.outputs.replicas }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: p
+        name: Select profile
+        run: |
+          PROFILE="${{ inputs.profile }}"
+          [ -z "$PROFILE" ] && PROFILE=$(cat .github/bench/push-profile)
+          echo "profile: $PROFILE"
+          if [ "$PROFILE" = smoke ]; then
+            echo "sf=1 fr=1 fi=2 sr=1 si=2 rs=1 replicas=[1]" | tr ' ' '\n' >> "$GITHUB_OUTPUT"
+          else
+            echo "sf=10 fr=5 fi=10 sr=3 si=5 rs=1 replicas=[1,2,3]" | tr ' ' '\n' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: ./.github/actions/setup
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Prepare base source (fork main + env patch only)
+        run: |
+          git worktree add base-src "$BASE_SHA"
+          git -C base-src apply "$PWD/.github/bench/env-patch.diff"
+          git -C base-src diff --stat
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-bench
+          workspaces: |
+            . -> target
+            base-src -> target
+      - name: Build head
+        run: |
+          cargo build --release -p datafusion-distributed-iceberg-benchmarks -p datafusion-distributed-benchmarks
+      - name: Build base
+        working-directory: base-src
+        run: cargo build --release -p datafusion-distributed-iceberg-benchmarks
+      - name: Stage binaries
+        run: |
+          mkdir -p bins
+          cp target/release/dfbench bins/dfbench
+          cp target/release/dfbench-iceberg bins/dfbench-iceberg-head
+          cp base-src/target/release/dfbench-iceberg bins/dfbench-iceberg-base
+          ls -la bins
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins
+          path: bins
+          retention-days: 3
+
+  bench:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: ${{ fromJSON(needs.build.outputs.replicas) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h
+      - name: Runner specs
+        run: |
+          mkdir -p out
+          { lscpu; echo; free -h; echo; df -h; echo; uname -a; nproc; } | tee out/runner-specs.txt
+      - name: Install perf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-tools-$(uname -r)" linux-tools-common || sudo apt-get install -y linux-tools-generic || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+          perf stat -e task-clock,instructions,cycles true || true
+      - uses: actions/download-artifact@v4
+        with:
+          name: bins
+          path: bins
+      - name: Prepare TPC-H SF${{ needs.build.outputs.sf }} as Iceberg
+        run: |
+          chmod +x bins/*
+          DATASET=$(bins/dfbench prepare-tpch --scale-factor ${{ needs.build.outputs.sf }})
+          ICEBERG=$(bins/dfbench-iceberg-head prepare --input "$DATASET")
+          echo "ICEBERG=$ICEBERG" >> "$GITHUB_ENV"
+          echo "$DATASET -> $ICEBERG" | tee out/dataset.txt
+          du -sh "$DATASET" "$ICEBERG" | tee -a out/dataset.txt
+          df -h
+      - name: Run interleaved benchmark
+        run: |
+          bash .github/bench/run.sh "$PWD/bins/dfbench-iceberg-base" "$PWD/bins/dfbench-iceberg-head" "$ICEBERG" out \
+            ${{ needs.build.outputs.fr }} ${{ needs.build.outputs.fi }} ${{ needs.build.outputs.sr }} ${{ needs.build.outputs.si }} ${{ needs.build.outputs.rs }}
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Replica ${{ matrix.replica }} — TPC-H SF${{ needs.build.outputs.sf }}"
+            echo '```'; grep -E 'Model name|^CPU\(s\)' out/runner-specs.txt; grep Mem: out/runner-specs.txt; cat out/perf-mode.txt 2>/dev/null; echo '```'
+            python3 .github/bench/analyze.py out
+          } | tee out/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-replica-${{ matrix.replica }}
+          path: out
+          retention-days: 14
+
+  combine:
+    needs: [build, bench]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-replica-*
+          path: all
+      - name: Combined summary
+        run: |
+          { echo "## All replicas combined — TPC-H SF${{ needs.build.outputs.sf }}"; python3 .github/bench/analyze.py all; } | tee combined.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: combined-summary
+          path: combined.md

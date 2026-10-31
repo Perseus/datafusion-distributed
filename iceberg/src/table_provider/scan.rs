@@ -77,7 +77,10 @@ pub(crate) async fn plan_scan(
             builder = builder.with_filter(predicates.clone());
         }
         // Column bounds let the scan skip files its dynamic filters can't match.
-        if IcebergConfig::from_task_context(&context).dynamic_filter_pruning_enabled {
+        if IcebergConfig::from_task_context(&context).dynamic_filter_pruning_enabled
+            // BENCH-ONLY ablation: skip the column-stats request.
+            && std::env::var_os("DFBENCH_ICEBERG_NO_COLUMN_STATS").is_none()
+        {
             let schema = match &table_snapshot {
                 Some(snap) => snap.schema(table.metadata()).map_err(df_err)?,
                 None => table.metadata().current_schema().clone(),

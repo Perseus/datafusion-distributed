@@ -237,7 +237,10 @@ impl WorkUnitFeedProvider for IcebergWorkUnitFeed {
                 scan_builder = scan_builder.with_filter(pred.clone());
             }
             // Column bounds let workers skip files the scan's dynamic filters can't match.
-            if IcebergConfig::from_task_context(&ctx).dynamic_filter_pruning_enabled {
+            if IcebergConfig::from_task_context(&ctx).dynamic_filter_pruning_enabled
+            // BENCH-ONLY ablation: skip the column-stats request.
+            && std::env::var_os("DFBENCH_ICEBERG_NO_COLUMN_STATS").is_none()
+            {
                 let metadata = self.iceberg_table.metadata();
                 let schema = match self.snapshot_id {
                     Some(id) => metadata.snapshot_by_id(id).map(|s| s.schema(metadata)),

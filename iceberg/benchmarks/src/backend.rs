@@ -20,8 +20,27 @@ impl BenchmarkBackend for IcebergBenchmarkBackend {
     }
 
     fn configure_session(&self, builder: SessionStateBuilder) -> SessionStateBuilder {
-        builder
+        let mut builder = builder
             .with_iceberg_integration(IcebergIntegrationOptions::default())
-            .with_iceberg_column_stats_enabled(true)
+            .with_iceberg_column_stats_enabled(true);
+        // BENCH PATCH: opt-in iceberg.* options via env vars; unset = unchanged.
+        let options = builder.config().get_or_insert_default().options_mut();
+        for (env, key) in [
+            (
+                "DFBENCH_ICEBERG_DYNAMIC_FILTER_PRUNING",
+                "iceberg.dynamic_filter_pruning_enabled",
+            ),
+            (
+                "DFBENCH_ICEBERG_ROW_SELECTION",
+                "iceberg.row_selection_enabled",
+            ),
+        ] {
+            if let Ok(value) = std::env::var(env) {
+                options
+                    .set(key, &value)
+                    .expect("invalid iceberg option value");
+            }
+        }
+        builder
     }
 }
