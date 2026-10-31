@@ -33,7 +33,8 @@ impl ScanConfig {
     /// Reads `tasks`. `filters` are the source's kept filters, against [`Self::schema`]; when
     /// `iceberg.dynamic_filter_pruning_enabled` is set, the dynamic ones among them prune each
     /// data file with their values at the time the reader starts it, and skip whole files whose
-    /// partition values can't match them, checked when the reader takes each task.
+    /// partition values can't match them, checked when the reader takes each task. They filter
+    /// rows inside the reader only when `datafusion.execution.parquet.pushdown_filters` is set.
     pub(crate) fn open(
         &self,
         tasks: FileScanTaskStream,
@@ -68,7 +69,18 @@ impl ScanConfig {
             && let Some(provider) =
                 DynamicFilterPredicateProvider::try_new(Arc::clone(compacted), &self.schema)
         {
-            builder = builder.with_runtime_predicate_provider(Arc::new(provider));
+            // Like DataFusion's Parquet scan, evaluate the filters row by row only with
+            // `pushdown_filters`; otherwise they only prune and the filter above the scan
+            // removes the remaining rows.
+            let pushdown_filters = context
+                .session_config()
+                .options()
+                .execution
+                .parquet
+                .pushdown_filters;
+            builder = builder
+                .with_runtime_predicate_provider(Arc::new(provider))
+                .with_runtime_predicate_row_filter(pushdown_filters);
         }
         let reader = builder.build();
 

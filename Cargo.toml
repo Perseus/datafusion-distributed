@@ -122,6 +122,9 @@ disallowed-methods = "deny"
 # upstream PRs DFD needs, each as its own commit:
 # - apache/iceberg-rust#3351: execution-time predicates in ArrowReader.
 # - apache/iceberg-rust#3424: optional column statistics on FileScanTask.
+# It also carries one fork-original change, not yet proposed upstream:
+# - ArrowReaderBuilder::with_runtime_predicate_row_filter, so runtime predicates
+#   can prune without being evaluated per row (related to #3351; epic #3343).
 # The branch is the same rev that datafusion-iceberg pins (5b82ab99) plus those
 # changes, so the graph still has a single `iceberg` crate. Every change, its
 # upstream status and when it can be dropped is tracked in DFD_FORK.md:
@@ -129,6 +132,6 @@ disallowed-methods = "deny"
 # Rebuild the branch whenever that pin moves:
 # https://github.com/Perseus/iceberg-rust/tree/dfd/runtime-predicate-5b82ab9
 [patch."https://github.com/apache/iceberg-rust"]
-iceberg = { git = "https://github.com/Perseus/iceberg-rust", rev = "1ddce488fc6f54e0cc9844a5c4e37bd284ccf37c" }
-iceberg-property-macro = { git = "https://github.com/Perseus/iceberg-rust", rev = "1ddce488fc6f54e0cc9844a5c4e37bd284ccf37c" }
-iceberg-storage-opendal = { git = "https://github.com/Perseus/iceberg-rust", rev = "1ddce488fc6f54e0cc9844a5c4e37bd284ccf37c" }
+iceberg = { git = "https://github.com/Perseus/iceberg-rust", rev = "99bd3c9e3d6be1092d9869e3a8839d4f4cff7805" }
+iceberg-property-macro = { git = "https://github.com/Perseus/iceberg-rust", rev = "99bd3c9e3d6be1092d9869e3a8839d4f4cff7805" }
+iceberg-storage-opendal = { git = "https://github.com/Perseus/iceberg-rust", rev = "99bd3c9e3d6be1092d9869e3a8839d4f4cff7805" }

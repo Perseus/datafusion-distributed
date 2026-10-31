@@ -25,7 +25,10 @@ extensions_options! {
         /// the filters, before opening them; then row groups, and also pages when
         /// `row_selection_enabled` is set. To skip files by their bounds, file listing keeps
         /// each file's manifest statistics for the projected columns, which makes each file
-        /// task larger. Results are unchanged: the filters are still applied above the scan.
+        /// task larger. The filters are evaluated row by row inside the scan only when
+        /// `datafusion.execution.parquet.pushdown_filters` is set, as DataFusion's Parquet scan
+        /// does; otherwise rows in the surviving row groups and pages are left to the filter
+        /// above the scan. Results are unchanged: the filters are still applied above the scan.
         pub dynamic_filter_pruning_enabled: bool, default = false
     }
 }

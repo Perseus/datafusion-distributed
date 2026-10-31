@@ -2,6 +2,7 @@
 mod tests {
     use std::sync::Arc;
 
+    use datafusion::arrow::compute::concat_batches;
     use datafusion::common::exec_datafusion_err;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::datasource::source::DataSourceExec;
@@ -13,9 +14,10 @@ mod tests {
     use datafusion_distributed_iceberg::{IcebergExt, IcebergIntegrationOptions};
     use datafusion_distributed_iceberg_test_tools::{
         CountingStorageFactory, FixtureCatalog, FixtureTable, IcebergTestHarness, TAXI_DAYS,
-        create_taxi_table, taxi_schema, taxi_trips,
+        TAXI_TRIPS_PER_DAY, create_taxi_table, taxi_schema, taxi_trips,
     };
     use iceberg::TableIdent;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
     /// Single node, so the join's build side is complete before the probe scan starts reading
     /// and the dynamic filter's value is known when every probe file opens. With pruning on,
@@ -697,6 +699,158 @@ mod tests {
             probe_rows,
             result: datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
         })
+    }
+
+    /// One unpartitioned file holding every day, in row groups of two days each. The probe
+    /// scan's dynamic filter keeps one day. With pruning on and the default
+    /// `datafusion.execution.parquet.pushdown_filters=false`, the filter skips the row groups
+    /// without that day but does not filter rows inside the one that has it: the probe scan
+    /// outputs that row group's two days, and the join drops the other day's rows. The files
+    /// read and the result are the same as with pruning off.
+    #[tokio::test]
+    async fn lazy_scan_prunes_row_groups_but_leaves_rows_to_the_join() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_two_days_per_row_group_taxi_table().await?)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_two_days_per_row_group_taxi_table().await?)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let (off_scans, off_batches) = run_scans(&off).await?;
+        let (on_scans, on_batches) = run_scans(&on).await?;
+
+        insta::assert_snapshot!(off_scans, @"
+        output_rows=25000: DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], predicate=pickup_date = 2024-01-10, physical_predicate=pickup_date@0 = 2024-01-10
+        output_rows=175000: DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], physical_predicate=DynamicFilter [ pickup_date@0 >= 2024-01-10 AND pickup_date@0 <= 2024-01-10 AND pickup_date@0 IN (SET) ([2024-01-10]) ]
+        ");
+        insta::assert_snapshot!(on_scans, @"
+        output_rows=25000: DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], predicate=pickup_date = 2024-01-10, physical_predicate=pickup_date@0 = 2024-01-10
+        output_rows=50000: DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], physical_predicate=DynamicFilter [ pickup_date@0 >= 2024-01-10 AND pickup_date@0 <= 2024-01-10 AND pickup_date@0 IN (SET) ([2024-01-10]) ]
+        ");
+        insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
+        data files read with pruning off: 2
+        data files read with pruning on: 2
+        ");
+        assert_eq!(off_batches, on_batches);
+        insta::assert_snapshot!(on_batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Like [lazy_scan_prunes_row_groups_but_leaves_rows_to_the_join], with
+    /// `datafusion.execution.parquet.pushdown_filters=true`: the dynamic filter also filters
+    /// rows inside the scan, so the probe scan outputs only the joined day. The files read and
+    /// the result are unchanged.
+    #[tokio::test]
+    async fn lazy_scan_with_pushdown_filters_filters_rows_with_dynamic_filter() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_two_days_per_row_group_taxi_table().await?)
+            .with_config_option("datafusion.execution.parquet.pushdown_filters", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_two_days_per_row_group_taxi_table().await?)
+            .with_config_option("datafusion.execution.parquet.pushdown_filters", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let (_, off_batches) = run_scans(&off).await?;
+        let (on_scans, on_batches) = run_scans(&on).await?;
+
+        insta::assert_snapshot!(on_scans, @"
+        output_rows=25000: DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], predicate=pickup_date = 2024-01-10, physical_predicate=pickup_date@0 = 2024-01-10
+        output_rows=25000: DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], physical_predicate=DynamicFilter [ pickup_date@0 >= 2024-01-10 AND pickup_date@0 <= 2024-01-10 AND pickup_date@0 IN (SET) ([2024-01-10]) ]
+        ");
+        insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
+        data files read with pruning off: 2
+        data files read with pruning on: 2
+        ");
+        assert_eq!(off_batches, on_batches);
+        insta::assert_snapshot!(on_batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Distributed over the table with two days per row group, with and without
+    /// `pushdown_filters`: whether the filter has a value when a file opens varies, so only the
+    /// result is checked; it matches the unpruned one.
+    #[tokio::test]
+    async fn distributed_join_over_multi_day_row_groups_returns_same_rows() -> Result<()> {
+        let (_, pruning_only) = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(create_two_days_per_row_group_taxi_table().await?)
+            .with_workers(2)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .query(JOIN_QUERY)
+            .await?;
+        let (_, row_filtered) = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(create_two_days_per_row_group_taxi_table().await?)
+            .with_workers(2)
+            .with_config_option("datafusion.execution.parquet.pushdown_filters", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .query(JOIN_QUERY)
+            .await?;
+
+        assert_eq!(pruning_only, row_filtered);
+        insta::assert_snapshot!(pruning_only, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Table `default.taxi`, unpartitioned, with every day's trips in one file, in date order,
+    /// written in row groups of two days each (four row groups) with column chunk statistics.
+    async fn create_two_days_per_row_group_taxi_table() -> Result<FixtureTable> {
+        let ident =
+            TableIdent::from_strs(["default", "taxi"]).map_err(|e| exec_datafusion_err!("{e}"))?;
+        let mut table = FixtureCatalog::try_new()
+            .await?
+            .table(ident, taxi_schema())
+            .create()
+            .await?;
+        let days = (0..TAXI_DAYS).map(taxi_trips).collect::<Result<Vec<_>>>()?;
+        let trips = concat_batches(&days[0].schema(), &days)?;
+        table
+            .append()
+            .writer_properties(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(2 * TAXI_TRIPS_PER_DAY))
+                    .set_statistics_enabled(EnabledStatistics::Chunk)
+                    .build(),
+            )
+            .file(trips)
+            .commit()
+            .await?;
+        Ok(table)
     }
 
     /// Table `default.taxi` with the taxi trips, one file (and row group) per day like
