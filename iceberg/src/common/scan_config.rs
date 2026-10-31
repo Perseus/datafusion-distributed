@@ -1,3 +1,4 @@
+use crate::common::partition_pruning::PartitionFilePruner;
 use crate::common::runtime_predicate::DynamicFilterPredicateProvider;
 use crate::{IcebergConfig, common::df_err};
 use datafusion::arrow::datatypes::SchemaRef;
@@ -9,7 +10,7 @@ use datafusion::physical_expr::{Partitioning, PhysicalExpr};
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt, future};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTaskStream;
@@ -30,7 +31,8 @@ pub(crate) struct ScanConfig {
 impl ScanConfig {
     /// Reads `tasks`. `filters` are the source's kept filters, against [`Self::schema`]; when
     /// `iceberg.dynamic_filter_pruning_enabled` is set, the dynamic ones among them prune each
-    /// data file with their values at the time the reader starts it.
+    /// data file with their values at the time the reader starts it, and skip whole files whose
+    /// partition values can't match them, checked when the reader takes each task.
     pub(crate) fn open(
         &self,
         tasks: FileScanTaskStream,
@@ -52,6 +54,15 @@ impl ScanConfig {
             builder = builder.with_runtime_predicate_provider(Arc::new(provider));
         }
         let reader = builder.build();
+
+        let tasks = match PartitionFilePruner::try_new(filters, &self.schema) {
+            Some(pruner) if config.dynamic_filter_pruning_enabled => tasks
+                .filter(move |task| {
+                    future::ready(!task.as_ref().is_ok_and(|task| pruner.should_skip(task)))
+                })
+                .boxed(),
+            _ => tasks,
+        };
 
         let stream = reader
             .read(tasks)

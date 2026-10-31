@@ -47,14 +47,7 @@ impl DynamicFilterPredicateProvider {
         filters: &[Arc<dyn PhysicalExpr>],
         arrow_schema: &SchemaRef,
     ) -> Option<Self> {
-        // Only conjuncts may be used: a dynamic filter under OR, NOT or any other expression
-        // doesn't restrict the rows the kept filter matches, so it is ignored (fail open).
-        let dynamic: Vec<_> = filters
-            .iter()
-            .flat_map(split_conjunction)
-            .filter(|expr| expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some())
-            .cloned()
-            .collect();
+        let dynamic = dynamic_conjuncts(filters);
         if dynamic.is_empty() {
             return None;
         }
@@ -65,6 +58,19 @@ impl DynamicFilterPredicateProvider {
             iceberg_schema,
         })
     }
+}
+
+/// Returns the dynamic filters among `filters` and their top-level AND conjuncts.
+///
+/// Only conjuncts may be used for pruning: a dynamic filter under OR, NOT or any other
+/// expression doesn't restrict the rows the kept filter matches, so it is ignored (fail open).
+pub(crate) fn dynamic_conjuncts(filters: &[Arc<dyn PhysicalExpr>]) -> Vec<Arc<dyn PhysicalExpr>> {
+    filters
+        .iter()
+        .flat_map(split_conjunction)
+        .filter(|expr| expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some())
+        .cloned()
+        .collect()
 }
 
 impl RuntimePredicateProvider for DynamicFilterPredicateProvider {
