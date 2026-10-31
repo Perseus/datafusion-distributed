@@ -301,12 +301,12 @@ mod tests {
             format!("pruning off: {}\npruning on: {}", off_run.probe_rows, on_run.probe_rows),
             @"
         pruning off: 175000
-        pruning on: 75000
+        pruning on: 50000
         "
         );
         insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
         data files read with pruning off: 9
-        data files read with pruning on: 5
+        data files read with pruning on: 4
         ");
         assert_eq!(off_run.result, on_run.result);
         insta::assert_snapshot!(on_run.result, @"
@@ -366,12 +366,12 @@ mod tests {
             format!("pruning off: {}\npruning on: {}", off_run.probe_rows, on_run.probe_rows),
             @"
         pruning off: 175000
-        pruning on: 75000
+        pruning on: 50000
         "
         );
         insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
         data files read with pruning off: 9
-        data files read with pruning on: 5
+        data files read with pruning on: 4
         ");
         assert_eq!(off_run.result, on_run.result);
         insta::assert_snapshot!(on_run.result, @"
@@ -416,13 +416,14 @@ mod tests {
         Ok(())
     }
 
-    /// Keeps the trips on the two days the build side selects. Without DISTINCT the build side
+    /// Keeps the trips on the two days the build side selects, which hash to different build
+    /// partitions, so the filter is a routing `CASE`. Without DISTINCT the build side
     /// isn't small, so with the single-partition thresholds at 0 the join is partitioned.
     const PARTITIONED_JOIN_QUERY: &str = r"SELECT COUNT(*) AS trips
         FROM taxi
         WHERE pickup_date IN (
             SELECT pickup_date FROM taxi
-            WHERE pickup_date IN (DATE '2024-01-10', DATE '2024-01-12')
+            WHERE pickup_date IN (DATE '2024-01-08', DATE '2024-01-14')
         )";
 
     struct PartitionedJoinRun {
