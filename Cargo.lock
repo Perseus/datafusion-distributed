@@ -2527,15 +2527,20 @@ dependencies = [
 name = "datafusion-distributed-iceberg-test-tools"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "datafusion",
  "datafusion-distributed",
  "datafusion-proto",
  "futures",
+ "futures-util",
  "iceberg",
  "rand 0.10.2",
  "rand_pcg",
+ "serde",
  "tempfile",
  "tokio",
+ "typetag",
 ]
 
 [[package]]

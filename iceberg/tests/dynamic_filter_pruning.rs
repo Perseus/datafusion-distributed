@@ -5,10 +5,13 @@ mod tests {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::error::Result;
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_plan::{collect, displayable};
     use datafusion_distributed::DistributedExt;
-    use datafusion_distributed_iceberg::IcebergExt;
-    use datafusion_distributed_iceberg_test_tools::{IcebergTestHarness, create_taxi_table};
+    use datafusion_distributed_iceberg::{IcebergExt, IcebergIntegrationOptions};
+    use datafusion_distributed_iceberg_test_tools::{
+        CountingStorageFactory, IcebergTestHarness, create_taxi_table,
+    };
 
     /// Single node, so the join's build side is complete before the probe scan starts reading
     /// and the dynamic filter's value is known when every probe file opens. With pruning on,
@@ -137,6 +140,139 @@ mod tests {
         +-------+
         ");
         Ok(())
+    }
+
+    /// Single node, over the taxi table, partitioned by identity on `pickup_date` with one file
+    /// per day. The semi-join's build side is the one day the static filter keeps, so its
+    /// dynamic filter rules out the other six days' files by their partition value. With pruning
+    /// on, the probe scan skips those files without opening them: the build scan reads its one
+    /// file, and the probe scan reads one file instead of seven. The result is the same.
+    #[tokio::test]
+    async fn lazy_scan_skips_files_by_partition_value() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let (_, off_batches) = off.query(SEMI_JOIN_QUERY).await?;
+        let (_, on_batches) = on.query(SEMI_JOIN_QUERY).await?;
+
+        insta::assert_snapshot!(
+            data_file_reads(&off_storage, &on_storage),
+            @"
+        data files read with pruning off: 8
+        data files read with pruning on: 2
+        "
+        );
+        assert_eq!(off_batches, on_batches);
+        insta::assert_snapshot!(on_batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Like [lazy_scan_skips_files_by_partition_value], for a scan whose files are planned
+    /// eagerly.
+    #[tokio::test]
+    async fn eager_scan_skips_files_by_partition_value() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let (_, off_batches) = off.query(SEMI_JOIN_QUERY).await?;
+        let (_, on_batches) = on.query(SEMI_JOIN_QUERY).await?;
+
+        insta::assert_snapshot!(
+            data_file_reads(&off_storage, &on_storage),
+            @"
+        data files read with pruning off: 8
+        data files read with pruning on: 2
+        "
+        );
+        assert_eq!(off_batches, on_batches);
+        insta::assert_snapshot!(on_batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Distributed, the worker probe scans may start before the dynamic filter has a value, so
+    /// which files get skipped varies; only the result is checked.
+    #[tokio::test]
+    async fn distributed_semi_join_with_file_skipping_returns_same_rows() -> Result<()> {
+        let (_, batches) = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(create_taxi_table().await?)
+            .with_workers(2)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .query(SEMI_JOIN_QUERY)
+            .await?;
+
+        insta::assert_snapshot!(batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Keeps the trips on the one day the build side selects.
+    const SEMI_JOIN_QUERY: &str = r"SELECT COUNT(*) AS trips
+        FROM taxi
+        WHERE pickup_date IN (SELECT DISTINCT pickup_date FROM taxi WHERE pickup_date = DATE '2024-01-10')";
+
+    /// Registers the Iceberg integration reading files through `storage`.
+    fn iceberg_integration(
+        storage: &CountingStorageFactory,
+    ) -> impl Fn(SessionStateBuilder) -> SessionStateBuilder + Send + Sync + 'static {
+        let storage = storage.clone();
+        move |state| {
+            state.with_iceberg_integration(IcebergIntegrationOptions {
+                storage_factory: Arc::new(storage.clone()),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn data_file_reads(off: &CountingStorageFactory, on: &CountingStorageFactory) -> String {
+        format!(
+            "data files read with pruning off: {}\ndata files read with pruning on: {}",
+            off.data_file_reads(),
+            on.data_file_reads()
+        )
     }
 
     /// The build side is one pickup date, so the join pushes a dynamic filter on

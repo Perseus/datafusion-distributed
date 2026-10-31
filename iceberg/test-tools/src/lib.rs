@@ -27,6 +27,7 @@
 
 mod append;
 mod catalog;
+mod counting_storage;
 mod error;
 mod harness;
 mod table;
@@ -34,6 +35,7 @@ mod taxi;
 
 pub use append::Append;
 pub use catalog::FixtureCatalog;
+pub use counting_storage::CountingStorageFactory;
 pub use harness::{
     IcebergTestHarness, IcebergTestHarnessBuilder, data_file_name, without_snapshots,
 };

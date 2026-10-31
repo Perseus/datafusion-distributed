@@ -8,6 +8,12 @@ repository = "https://github.com/datafusion-contrib/datafusion-distributed"
 publish = false
 
 [dependencies]
+# For the counting storage, which implements iceberg-rust's storage traits.
+async-trait = "0.1"
+bytes = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+typetag = "0.2"
 # Only for its Arrow and Parquet re-exports, which keep this crate on the
 # versions the rest of the workspace resolves to.
 datafusion = { workspace = true, features = ["parquet", "sql"] }
