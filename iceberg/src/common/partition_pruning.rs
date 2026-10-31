@@ -140,7 +140,7 @@ fn output_column(schema: &SchemaRef, field_id: i32) -> Option<usize> {
 }
 
 /// Converts a partition value of Iceberg type `source_type` to a value of `output_type`, or
-/// `None` when the types don't exactly correspond.
+/// `None` when the types don't exactly correspond, or when a float value is zero or NaN.
 fn literal_to_scalar(
     literal: &Literal,
     source_type: &PrimitiveType,
@@ -159,10 +159,16 @@ fn literal_to_scalar(
         (PrimitiveType::Long, PrimitiveLiteral::Long(v), DataType::Int64) => {
             ScalarValue::Int64(Some(*v))
         }
-        (PrimitiveType::Float, PrimitiveLiteral::Float(v), DataType::Float32) => {
+        // Iceberg puts -0 and +0, and every NaN, in one partition, so a zero or NaN partition
+        // value doesn't bound the file's rows exactly: leave it unknown.
+        (PrimitiveType::Float, PrimitiveLiteral::Float(v), DataType::Float32)
+            if v.0 != 0.0 && !v.0.is_nan() =>
+        {
             ScalarValue::Float32(Some(v.0))
         }
-        (PrimitiveType::Double, PrimitiveLiteral::Double(v), DataType::Float64) => {
+        (PrimitiveType::Double, PrimitiveLiteral::Double(v), DataType::Float64)
+            if v.0 != 0.0 && !v.0.is_nan() =>
+        {
             ScalarValue::Float64(Some(v.0))
         }
         (PrimitiveType::Date, PrimitiveLiteral::Int(v), DataType::Date32) => {
@@ -221,6 +227,7 @@ mod tests {
         id: unknown
         day: min=Exact(Date32(\"2024-01-10\")) max=Exact(Date32(\"2024-01-10\")) nulls=Exact(0)
         name: unknown
+        score: unknown
         ");
     }
 
@@ -236,6 +243,7 @@ mod tests {
         id: unknown
         day: unknown
         name: unknown
+        score: unknown
         ");
     }
 
@@ -248,6 +256,7 @@ mod tests {
         id: unknown
         day: unknown
         name: min=Absent max=Absent nulls=Exact(10)
+        score: unknown
         ");
     }
 
@@ -269,12 +278,14 @@ mod tests {
         id: min=Exact(Int32(7)) max=Exact(Int32(7)) nulls=Exact(0)
         day: unknown
         name: unknown
+        score: unknown
         ");
         insta::assert_snapshot!(describe(&new, &output_schema()), @"
         rows=Exact(10)
         id: unknown
         day: unknown
         name: min=Exact(Utf8(\"a\")) max=Exact(Utf8(\"a\")) nulls=Exact(0)
+        score: unknown
         ");
     }
 
@@ -298,7 +309,35 @@ mod tests {
         id: unknown
         day: unknown
         name: unknown
+        score: unknown
         ");
+    }
+
+    /// Iceberg puts -0.0 and 0.0 rows in one partition, and every NaN in another, so those
+    /// values are left unknown; other float values are exact.
+    #[test]
+    fn zero_and_nan_float_partition_values_are_left_unknown() {
+        let describe_score = |value: f64| {
+            let task = task(
+                spec(&[("score", Transform::Identity)]),
+                [Some(Literal::double(value))],
+            );
+            describe(&task, &output_schema())
+                .lines()
+                .find(|line| line.starts_with("score"))
+                .unwrap()
+                .to_string()
+        };
+
+        insta::assert_snapshot!(
+            [0.0, -0.0, f64::NAN, 1.5].map(describe_score).join("\n"),
+            @"
+        score: unknown
+        score: unknown
+        score: unknown
+        score: min=Exact(Float64(1.5)) max=Exact(Float64(1.5)) nulls=Exact(0)
+        "
+        );
     }
 
     fn table_schema() -> Arc<Schema> {
@@ -308,6 +347,8 @@ mod tests {
                     NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
                     NestedField::optional(2, "day", Type::Primitive(PrimitiveType::Date)).into(),
                     NestedField::optional(3, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(4, "score", Type::Primitive(PrimitiveType::Double))
+                        .into(),
                 ])
                 .build()
                 .unwrap(),
@@ -340,7 +381,7 @@ mod tests {
             .with_data_file_path("file:///t/data/f.parquet".to_string())
             .with_data_file_format(DataFileFormat::Parquet)
             .with_schema(table_schema())
-            .with_project_field_ids(vec![1, 2, 3])
+            .with_project_field_ids(vec![1, 2, 3, 4])
             .with_partition(Some(Struct::from_iter(values)))
             .with_partition_spec(Some(spec))
             .with_case_sensitive(true)
