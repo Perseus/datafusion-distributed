@@ -1,4 +1,5 @@
 use crate::common::df_err;
+use crate::common::partition_pruning::column_stats_columns;
 use crate::common::scan_config::ScanConfig;
 use crate::eager::assign_files;
 use crate::eager::planned_files::PlannedFiles;
@@ -74,6 +75,15 @@ pub(crate) async fn plan_scan(
         }
         if let Some(predicates) = &predicates {
             builder = builder.with_filter(predicates.clone());
+        }
+        // Column bounds let the scan skip files its dynamic filters can't match.
+        if IcebergConfig::from_task_context(&context).dynamic_filter_pruning_enabled {
+            let schema = match &table_snapshot {
+                Some(snap) => snap.schema(table.metadata()).map_err(df_err)?,
+                None => table.metadata().current_schema().clone(),
+            };
+            builder =
+                builder.with_column_stats(column_stats_columns(&schema, projection.as_deref()));
         }
         let table_scan = builder.build().map_err(df_err)?;
         // File discovery runs on Iceberg's I/O runtime and is canceled if planning is dropped.

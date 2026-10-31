@@ -323,11 +323,11 @@ mod tests {
     }
 
     /// The same partitioned join over a table that isn't partitioned, so no file can be
-    /// skipped by its partition values and every data file is read either way. The routing
-    /// `CASE` still prunes the row groups of the days no build partition holds, using their
-    /// column statistics.
+    /// skipped by its partition values. Each file holds one day, so its column bounds from the
+    /// manifest show the routing `CASE` can't match it unless a build partition holds that
+    /// day: the probe scan reads 2 of its 7 files (plus the build side's 2).
     #[tokio::test]
-    async fn lazy_scan_prunes_row_groups_with_partitioned_join_filter() -> Result<()> {
+    async fn lazy_scan_skips_unpartitioned_files_with_partitioned_join_filter() -> Result<()> {
         let off_storage = CountingStorageFactory::new();
         let off = IcebergTestHarness::builder()
             .with_session_extension(iceberg_integration(&off_storage))
@@ -374,7 +374,7 @@ mod tests {
         );
         insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
         data files read with pruning off: 9
-        data files read with pruning on: 9
+        data files read with pruning on: 4
         ");
         assert_eq!(off_run.result, on_run.result);
         insta::assert_snapshot!(on_run.result, @"
@@ -382,6 +382,172 @@ mod tests {
         | trips |
         +-------+
         | 50000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Like [lazy_scan_skips_unpartitioned_files_with_partitioned_join_filter], for a scan
+    /// whose files are planned eagerly.
+    #[tokio::test]
+    async fn eager_scan_skips_unpartitioned_files_with_partitioned_join_filter() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let off_run = run_partitioned_join(&off).await?;
+        let on_run = run_partitioned_join(&on).await?;
+
+        insta::assert_snapshot!(off_run.join_mode, @"Partitioned");
+        insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
+        data files read with pruning off: 9
+        data files read with pruning on: 4
+        ");
+        assert_eq!(off_run.result, on_run.result);
+        insta::assert_snapshot!(on_run.result, @"
+        +-------+
+        | trips |
+        +-------+
+        | 50000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// A single-partition (`CollectLeft`) join over the unpartitioned table: its dynamic filter
+    /// holds the one joined day, and each probe file's column bounds show whether it can
+    /// match, so the probe scan reads only that day's file.
+    #[tokio::test]
+    async fn lazy_scan_skips_unpartitioned_files_with_dynamic_filter() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let (_, off_batches) = run_scans(&off).await?;
+        let (on_scans, on_batches) = run_scans(&on).await?;
+
+        insta::assert_snapshot!(on_scans, @"
+        output_rows=25000: DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], predicate=pickup_date = 2024-01-10, physical_predicate=pickup_date@0 = 2024-01-10
+        output_rows=25000: DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], physical_predicate=DynamicFilter [ pickup_date@0 >= 2024-01-10 AND pickup_date@0 <= 2024-01-10 AND pickup_date@0 IN (SET) ([2024-01-10]) ]
+        ");
+        insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
+        data files read with pruning off: 8
+        data files read with pruning on: 2
+        ");
+        assert_eq!(off_batches, on_batches);
+        insta::assert_snapshot!(on_batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Like [lazy_scan_skips_unpartitioned_files_with_dynamic_filter], for a scan whose files
+    /// are planned eagerly.
+    #[tokio::test]
+    async fn eager_scan_skips_unpartitioned_files_with_dynamic_filter() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let (_, off_batches) = run_scans(&off).await?;
+        let (on_scans, on_batches) = run_scans(&on).await?;
+
+        insta::assert_snapshot!(on_scans, @"
+        output_rows=25000: DataSourceExec: format=iceberg, planned_files=1, predicate=pickup_date@0 = 2024-01-10
+        output_rows=25000: DataSourceExec: format=iceberg, planned_files=7, predicate=DynamicFilter [ pickup_date@0 >= 2024-01-10 AND pickup_date@0 <= 2024-01-10 AND pickup_date@0 IN (SET) ([2024-01-10]) ]
+        ");
+        insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
+        data files read with pruning off: 8
+        data files read with pruning on: 2
+        ");
+        assert_eq!(off_batches, on_batches);
+        insta::assert_snapshot!(on_batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Distributed over the unpartitioned table, the file tasks and their column statistics
+    /// travel to the workers; whether the filter has a value when a file opens varies, so only
+    /// the result is checked.
+    #[tokio::test]
+    async fn distributed_unpartitioned_join_with_file_skipping_returns_same_rows() -> Result<()> {
+        let (_, batches) = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(create_unpartitioned_taxi_table().await?)
+            .with_workers(2)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .query(JOIN_QUERY)
+            .await?;
+
+        insta::assert_snapshot!(batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
         +-------+
         ");
         Ok(())

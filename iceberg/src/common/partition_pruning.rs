@@ -1,10 +1,12 @@
-//! Skips whole data files whose partition values can't match a scan's kept dynamic filters,
-//! before the Iceberg Arrow reader opens them.
+//! Skips whole data files whose partition values or column bounds can't match a scan's kept
+//! dynamic filters, before the Iceberg Arrow reader opens them.
 
 use std::sync::{Arc, Mutex};
 
+use datafusion::arrow::array::{ArrayRef, BooleanArray};
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use datafusion::common::pruning::PrunableStatistics;
+use datafusion::common::Column;
+use datafusion::common::pruning::{PrunableStatistics, PruningStatistics};
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -14,13 +16,14 @@ use datafusion::physical_expr_common::physical_expr::{
 };
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Transform, Type};
+use iceberg::spec::{Datum, Literal, PrimitiveLiteral, PrimitiveType, Transform, Type};
+use std::collections::{HashMap, HashSet};
 
 use crate::common::case_as_or::rewrite_case_as_or;
 use crate::common::runtime_predicate::dynamic_conjuncts;
 
 /// Decides, per data-file task, whether the scan's kept dynamic filters rule out every row of
-/// the file given its partition values.
+/// the file given its partition values and column bounds.
 ///
 /// It evaluates a DataFusion [`PruningPredicate`], the check DataFusion's Parquet scan runs
 /// before opening a file, over statistics built by [`file_statistics`]. A file is skipped only
@@ -62,10 +65,7 @@ impl PartitionFilePruner {
         let Some(pruning_predicate) = self.pruning_predicate() else {
             return false;
         };
-        let statistics = PrunableStatistics::new(
-            vec![Arc::new(file_statistics(task, &self.schema))],
-            Arc::clone(&self.schema),
-        );
+        let statistics = FileStatistics::new(file_statistics(task, &self.schema), &self.schema);
         match pruning_predicate.prune(&statistics) {
             Ok(keep) => keep.iter().all(|keep| !keep),
             Err(_) => false,
@@ -95,15 +95,46 @@ impl PartitionFilePruner {
     }
 }
 
+/// The columns to request column statistics for, so files can be skipped by their bounds: the
+/// scan's projected columns, or every column when `projection` is `None`, that are primitive
+/// fields of `schema`, the scanned snapshot's schema. These are the only columns a filter on
+/// the scan's output can reference; other names, such as metadata columns, have no statistics.
+pub(crate) fn column_stats_columns(
+    schema: &iceberg::spec::Schema,
+    projection: Option<&[String]>,
+) -> Vec<String> {
+    let names: Vec<String> = match projection {
+        Some(names) => names.to_vec(),
+        None => schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect(),
+    };
+    names
+        .into_iter()
+        .filter(|name| {
+            schema
+                .field_by_name(name)
+                .is_some_and(|field| field.field_type.is_primitive())
+        })
+        .collect()
+}
+
 /// File-level statistics for `task`, one column per field of `schema`, the scan's output schema.
 ///
-/// Only partition values are used for now; every column they don't describe is unknown.
-/// Column bounds from the task's manifest entry could later be merged in per column.
+/// Columns are described by the task's column bounds, see [`column_bound_statistics`], and by
+/// its identity partition values, see [`partition_column_statistics`]. A partition value is
+/// exact, so where both describe a column it replaces the bounds. Every other column is unknown.
 pub(crate) fn file_statistics(task: &FileScanTask, schema: &SchemaRef) -> Statistics {
     let num_rows = task
         .record_count()
         .map_or(Precision::Absent, |n| Precision::Exact(n as usize));
     let mut column_statistics = vec![ColumnStatistics::new_unknown(); schema.fields().len()];
+    for (index, stats) in column_bound_statistics(task, schema) {
+        column_statistics[index] = stats;
+    }
     for (index, stats) in partition_column_statistics(task, schema, num_rows) {
         column_statistics[index] = stats;
     }
@@ -111,6 +142,148 @@ pub(crate) fn file_statistics(task: &FileScanTask, schema: &SchemaRef) -> Statis
         num_rows,
         total_byte_size: Precision::Absent,
         column_statistics,
+    }
+}
+
+/// Statistics, by output column index, from the column statistics the task carries from its
+/// manifest entry (requested through `TableScanBuilder::with_column_stats`).
+///
+/// Bounds become inexact min and max: Iceberg may truncate string and binary bounds, but a
+/// truncated lower bound still bounds the values from below and a truncated upper bound is
+/// rounded up, and DataFusion compares them byte-wise as Iceberg does. A missing bound is
+/// unknown, never empty. A bound is used only when its type exactly matches the output column.
+///
+/// Float and double bounds exclude NaN, which DataFusion orders above every value, or below it
+/// for a negative NaN, so they are used only when the file is known to hold no NaN. Their zero
+/// bounds are widened, a lower bound to -0.0 and an upper bound to +0.0, because Iceberg doesn't
+/// order -0.0 before +0.0 while DataFusion does.
+///
+/// Null counts are exact for the file. Delete files only remove rows, so these statistics
+/// cover more rows than the scan returns, which can only keep files.
+fn column_bound_statistics(
+    task: &FileScanTask,
+    schema: &SchemaRef,
+) -> Vec<(usize, ColumnStatistics)> {
+    let Some(stats) = task.column_stats() else {
+        return Vec::new();
+    };
+    let mut columns = Vec::new();
+    for (index, field) in schema.fields().iter().enumerate() {
+        let Some(field_id) = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let output_type = field.data_type();
+        let mut column = ColumnStatistics::new_unknown();
+        if let Some(nulls) = stats.null_value_counts().get(&field_id) {
+            column = column.with_null_count(Precision::Exact(*nulls as usize));
+        }
+        let is_float = matches!(output_type, DataType::Float32 | DataType::Float64);
+        let bounds_usable = !is_float
+            || stats
+                .nan_value_counts()
+                .get(&field_id)
+                .is_some_and(|n| *n == 0);
+        if bounds_usable {
+            let bound = |bounds: &HashMap<i32, Datum>, lower: bool| {
+                let scalar = bound_to_scalar(bounds.get(&field_id)?, output_type)?;
+                widen_float_zero(scalar, lower)
+            };
+            if let Some(min) = bound(stats.lower_bounds(), true) {
+                column = column.with_min_value(Precision::Inexact(min));
+            }
+            if let Some(max) = bound(stats.upper_bounds(), false) {
+                column = column.with_max_value(Precision::Inexact(max));
+            }
+        }
+        if column != ColumnStatistics::new_unknown() {
+            columns.push((index, column));
+        }
+    }
+    columns
+}
+
+/// Converts a column bound to a value of `output_type`, `None` when the types don't exactly
+/// correspond.
+fn bound_to_scalar(bound: &Datum, output_type: &DataType) -> Option<ScalarValue> {
+    primitive_to_scalar(bound.data_type(), bound.literal(), output_type)
+}
+
+/// Widens a float zero bound to include both zeros: -0.0 for a lower bound, +0.0 for an upper
+/// one. A NaN bound is unknown. Other values are returned unchanged.
+fn widen_float_zero(value: ScalarValue, lower: bool) -> Option<ScalarValue> {
+    match value {
+        ScalarValue::Float32(Some(v)) if v.is_nan() => None,
+        ScalarValue::Float64(Some(v)) if v.is_nan() => None,
+        ScalarValue::Float32(Some(0.0)) => {
+            Some(ScalarValue::Float32(Some(if lower { -0.0 } else { 0.0 })))
+        }
+        ScalarValue::Float64(Some(0.0)) => {
+            Some(ScalarValue::Float64(Some(if lower { -0.0 } else { 0.0 })))
+        }
+        value => Some(value),
+    }
+}
+
+/// [`PruningStatistics`] for one file's [`Statistics`]. Unlike [`PrunableStatistics`], which
+/// only reads exact values, min and max may be inexact: pruning only needs them to bound the
+/// file's values. Null and row counts are still read only when exact.
+struct FileStatistics {
+    statistics: Arc<Statistics>,
+    schema: SchemaRef,
+    exact_counts: PrunableStatistics,
+}
+
+impl FileStatistics {
+    fn new(statistics: Statistics, schema: &SchemaRef) -> Self {
+        let statistics = Arc::new(statistics);
+        Self {
+            exact_counts: PrunableStatistics::new(
+                vec![Arc::clone(&statistics)],
+                Arc::clone(schema),
+            ),
+            statistics,
+            schema: Arc::clone(schema),
+        }
+    }
+
+    fn bound(
+        &self,
+        column: &Column,
+        get: impl Fn(&ColumnStatistics) -> &Precision<ScalarValue>,
+    ) -> Option<ArrayRef> {
+        let index = self.schema.index_of(column.name()).ok()?;
+        let value = get(self.statistics.column_statistics.get(index)?).get_value()?;
+        value.to_array().ok()
+    }
+}
+
+impl PruningStatistics for FileStatistics {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.bound(column, |stats| &stats.min_value)
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.bound(column, |stats| &stats.max_value)
+    }
+
+    fn num_containers(&self) -> usize {
+        1
+    }
+
+    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+        self.exact_counts.null_counts(column)
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        self.exact_counts.row_counts()
+    }
+
+    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        None
     }
 }
 
@@ -183,6 +356,23 @@ fn literal_to_scalar(
     let Literal::Primitive(value) = literal else {
         return None;
     };
+    // Iceberg puts -0 and +0, and every NaN, in one partition, so a zero or NaN partition
+    // value doesn't bound the file's rows exactly: leave it unknown.
+    match value {
+        PrimitiveLiteral::Float(v) if v.0 == 0.0 || v.0.is_nan() => return None,
+        PrimitiveLiteral::Double(v) if v.0 == 0.0 || v.0.is_nan() => return None,
+        _ => {}
+    }
+    primitive_to_scalar(source_type, value, output_type)
+}
+
+/// Converts an Iceberg value of type `source_type` to a value of `output_type`, or `None` when
+/// the types don't exactly correspond.
+fn primitive_to_scalar(
+    source_type: &PrimitiveType,
+    value: &PrimitiveLiteral,
+    output_type: &DataType,
+) -> Option<ScalarValue> {
     let scalar = match (source_type, value, output_type) {
         (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(v), DataType::Boolean) => {
             ScalarValue::Boolean(Some(*v))
@@ -193,16 +383,10 @@ fn literal_to_scalar(
         (PrimitiveType::Long, PrimitiveLiteral::Long(v), DataType::Int64) => {
             ScalarValue::Int64(Some(*v))
         }
-        // Iceberg puts -0 and +0, and every NaN, in one partition, so a zero or NaN partition
-        // value doesn't bound the file's rows exactly: leave it unknown.
-        (PrimitiveType::Float, PrimitiveLiteral::Float(v), DataType::Float32)
-            if v.0 != 0.0 && !v.0.is_nan() =>
-        {
+        (PrimitiveType::Float, PrimitiveLiteral::Float(v), DataType::Float32) => {
             ScalarValue::Float32(Some(v.0))
         }
-        (PrimitiveType::Double, PrimitiveLiteral::Double(v), DataType::Float64)
-            if v.0 != 0.0 && !v.0.is_nan() =>
-        {
+        (PrimitiveType::Double, PrimitiveLiteral::Double(v), DataType::Float64) => {
             ScalarValue::Float64(Some(v.0))
         }
         (PrimitiveType::Date, PrimitiveLiteral::Int(v), DataType::Date32) => {
@@ -216,6 +400,12 @@ fn literal_to_scalar(
         }
         (PrimitiveType::String, PrimitiveLiteral::String(v), DataType::Utf8View) => {
             ScalarValue::Utf8View(Some(v.clone()))
+        }
+        (PrimitiveType::Binary, PrimitiveLiteral::Binary(v), DataType::Binary) => {
+            ScalarValue::Binary(Some(v.clone()))
+        }
+        (PrimitiveType::Binary, PrimitiveLiteral::Binary(v), DataType::LargeBinary) => {
+            ScalarValue::LargeBinary(Some(v.clone()))
         }
         (
             PrimitiveType::Timestamp,
@@ -251,6 +441,7 @@ mod tests {
         BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, lit,
     };
     use iceberg::arrow::schema_to_arrow_schema;
+    use iceberg::scan::FileScanTaskColumnStats;
     use iceberg::spec::{DataFileFormat, NestedField, PartitionSpec, Schema, Struct};
 
     #[test]
@@ -378,6 +569,203 @@ mod tests {
         );
     }
 
+    #[test]
+    fn column_bounds_are_inexact_min_and_max() {
+        let stats = FileScanTaskColumnStats::builder()
+            .with_lower_bounds(HashMap::from([
+                (1, Datum::int(3)),
+                (2, Datum::date(19730)),
+                (3, Datum::string("apple")),
+            ]))
+            .with_upper_bounds(HashMap::from([
+                (1, Datum::int(9)),
+                (2, Datum::date(19736)),
+                (3, Datum::string("melon")),
+            ]))
+            .with_null_value_counts(HashMap::from([(1, 0), (3, 2)]))
+            .build();
+
+        insta::assert_snapshot!(describe(&task_with_stats(stats), &output_schema()), @"
+        rows=Exact(10)
+        id: min=Inexact(Int32(3)) max=Inexact(Int32(9)) nulls=Exact(0)
+        day: min=Inexact(Date32(\"2024-01-08\")) max=Inexact(Date32(\"2024-01-14\")) nulls=Absent
+        name: min=Inexact(Utf8(\"apple\")) max=Inexact(Utf8(\"melon\")) nulls=Exact(2)
+        score: unknown
+        ");
+    }
+
+    /// Iceberg truncates long string bounds: the lower bound to a prefix, the upper bound to a
+    /// prefix with its last character incremented. Both still bound the values, so a filter
+    /// on a value between them keeps the file and one past them skips it.
+    #[test]
+    fn truncated_string_bounds_still_bound_the_values() {
+        // Values from "abcdef-long" to "abcxyz-long", truncated to 3 characters.
+        let stats = FileScanTaskColumnStats::builder()
+            .with_lower_bounds(HashMap::from([(3, Datum::string("abc"))]))
+            .with_upper_bounds(HashMap::from([(3, Datum::string("abd"))]))
+            .build();
+        let task = task_with_stats(stats);
+        let name: Arc<dyn PhysicalExpr> = Arc::new(Column::new("name", 2));
+        let skips = |value: &str| {
+            let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+                vec![Arc::clone(&name)],
+                Arc::new(BinaryExpr::new(Arc::clone(&name), Operator::Eq, lit(value))),
+            ));
+            let pruner = PartitionFilePruner::try_new(&[filter as _], &output_schema()).unwrap();
+            format!("name = {value}: skip={}", pruner.should_skip(&task))
+        };
+
+        insta::assert_snapshot!(
+            ["abcdef-long", "abcxyz-long", "abd-long", "abb"].map(skips).join("\n"),
+            @"
+        name = abcdef-long: skip=false
+        name = abcxyz-long: skip=false
+        name = abd-long: skip=true
+        name = abb: skip=true
+        "
+        );
+    }
+
+    /// The output reads `id` as Int64, which doesn't match the Iceberg Int bounds.
+    #[test]
+    fn column_bounds_of_another_type_are_left_unknown() {
+        let stats = FileScanTaskColumnStats::builder()
+            .with_lower_bounds(HashMap::from([(1, Datum::int(3))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::int(9))]))
+            .build();
+        let mut fields: Vec<Field> = output_schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields[0] = fields[0].clone().with_data_type(DataType::Int64);
+        let output = Arc::new(ArrowSchema::new(fields));
+
+        insta::assert_snapshot!(describe(&task_with_stats(stats), &output), @"
+        rows=Exact(10)
+        id: unknown
+        day: unknown
+        name: unknown
+        score: unknown
+        ");
+    }
+
+    /// Missing bounds are unknown, not empty; a column that is all nulls may have no bounds
+    /// and is described by its null count alone.
+    #[test]
+    fn missing_bounds_are_left_unknown() {
+        let stats = FileScanTaskColumnStats::builder()
+            .with_null_value_counts(HashMap::from([(3, 10)]))
+            .build();
+
+        insta::assert_snapshot!(describe(&task_with_stats(stats), &output_schema()), @"
+        rows=Exact(10)
+        id: unknown
+        day: unknown
+        name: min=Absent max=Absent nulls=Exact(10)
+        score: unknown
+        ");
+    }
+
+    /// Float bounds exclude NaN, so they are used only when the file is known to hold none.
+    /// Zero bounds are widened to cover both -0.0 and +0.0.
+    #[test]
+    fn float_bounds_need_a_zero_nan_count_and_widen_zeros() {
+        let describe_score = |lower: f64, upper: f64, nans: Option<u64>| {
+            let stats = FileScanTaskColumnStats::builder()
+                .with_lower_bounds(HashMap::from([(4, Datum::double(lower))]))
+                .with_upper_bounds(HashMap::from([(4, Datum::double(upper))]))
+                .with_nan_value_counts(nans.map(|n| HashMap::from([(4, n)])).unwrap_or_default())
+                .build();
+            let line = describe(&task_with_stats(stats), &output_schema())
+                .lines()
+                .find(|line| line.starts_with("score"))
+                .unwrap()
+                .to_string();
+            format!("[{lower:?}, {upper:?}] nans={nans:?} -> {line}")
+        };
+
+        insta::assert_snapshot!(
+            [
+                describe_score(1.5, 2.5, Some(0)),
+                describe_score(1.5, 2.5, Some(3)),
+                describe_score(1.5, 2.5, None),
+                describe_score(0.0, -0.0, Some(0)),
+                describe_score(-0.0, 0.0, Some(0)),
+            ]
+            .join("\n"),
+            @"
+        [1.5, 2.5] nans=Some(0) -> score: min=Inexact(Float64(1.5)) max=Inexact(Float64(2.5)) nulls=Absent
+        [1.5, 2.5] nans=Some(3) -> score: unknown
+        [1.5, 2.5] nans=None -> score: unknown
+        [0.0, -0.0] nans=Some(0) -> score: min=Inexact(Float64(-0)) max=Inexact(Float64(0)) nulls=Absent
+        [-0.0, 0.0] nans=Some(0) -> score: min=Inexact(Float64(-0)) max=Inexact(Float64(0)) nulls=Absent
+        "
+        );
+    }
+
+    /// An identity partition value is exact, so it replaces the column's bounds; other
+    /// columns keep their bounds.
+    #[test]
+    fn partition_values_take_precedence_over_column_bounds() {
+        let stats = FileScanTaskColumnStats::builder()
+            .with_lower_bounds(HashMap::from([(1, Datum::int(3)), (2, Datum::date(19700))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::int(9)), (2, Datum::date(19800))]))
+            .build();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_record_count(Some(10))
+            .with_data_file_path("file:///t/data/f.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table_schema())
+            .with_project_field_ids(vec![1, 2, 3, 4])
+            .with_partition(Some(Struct::from_iter([Some(Literal::date(19732))])))
+            .with_partition_spec(Some(spec(&[("day", Transform::Identity)])))
+            .with_column_stats(Some(stats))
+            .with_case_sensitive(true)
+            .build()
+            .unwrap();
+
+        insta::assert_snapshot!(describe(&task, &output_schema()), @r#"
+        rows=Exact(10)
+        id: min=Inexact(Int32(3)) max=Inexact(Int32(9)) nulls=Absent
+        day: min=Exact(Date32("2024-01-10")) max=Exact(Date32("2024-01-10")) nulls=Exact(0)
+        name: unknown
+        score: unknown
+        "#);
+    }
+
+    #[test]
+    fn requests_stats_for_projected_primitive_columns() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "tags",
+                    Type::List(iceberg::spec::ListType::new(
+                        NestedField::list_element(3, Type::Primitive(PrimitiveType::String), false)
+                            .into(),
+                    )),
+                )
+                .into(),
+                NestedField::optional(4, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        assert_eq!(column_stats_columns(&schema, None), vec!["id", "name"]);
+        assert_eq!(
+            column_stats_columns(
+                &schema,
+                Some(&["name".to_string(), "tags".to_string(), "_file".to_string()])
+            ),
+            vec!["name"]
+        );
+    }
+
     fn table_schema() -> Arc<Schema> {
         Arc::new(
             Schema::builder()
@@ -485,6 +873,22 @@ mod tests {
             .with_project_field_ids(vec![1, 2, 3, 4])
             .with_partition(Some(Struct::from_iter(values)))
             .with_partition_spec(Some(spec))
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
+    }
+
+    fn task_with_stats(stats: FileScanTaskColumnStats) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_record_count(Some(10))
+            .with_data_file_path("file:///t/data/f.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table_schema())
+            .with_project_field_ids(vec![1, 2, 3, 4])
+            .with_column_stats(Some(stats))
             .with_case_sensitive(true)
             .build()
             .unwrap()
