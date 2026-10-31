@@ -1,32 +1,42 @@
 //! Skips whole data files whose partition values can't match a scan's kept dynamic filters,
 //! before the Iceberg Arrow reader opens them.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::stats::Precision;
+use datafusion::common::pruning::PrunableStatistics;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
-use datafusion::datasource::listing::PartitionedFile;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_expr::{PhysicalExpr, conjunction};
-use datafusion::physical_optimizer::pruning::FilePruner;
-use datafusion::physical_plan::metrics::Count;
+use datafusion::physical_expr_common::physical_expr::{snapshot_generation, snapshot_physical_expr};
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Transform, Type};
 
+use crate::common::case_as_or::rewrite_case_as_or;
 use crate::common::runtime_predicate::dynamic_conjuncts;
 
 /// Decides, per data-file task, whether the scan's kept dynamic filters rule out every row of
 /// the file given its partition values.
 ///
-/// It uses DataFusion's [`FilePruner`], the same check DataFusion's Parquet scan runs before
-/// opening a file, over statistics built by [`file_statistics`]. A file is skipped only when
-/// the pruner proves no row can match; any error or unsupported case keeps the file. The
-/// filters are read when the task is checked, never waited on, and are still applied by the
-/// `FilterExec` above the scan, so skipping only decides which files are read.
+/// It evaluates a DataFusion [`PruningPredicate`], the check DataFusion's Parquet scan runs
+/// before opening a file, over statistics built by [`file_statistics`]. A file is skipped only
+/// when the predicate proves no row can match; any error or unsupported case keeps the file.
+/// The filters are read when the task is checked, never waited on, and are still applied by
+/// the `FilterExec` above the scan, so skipping only decides which files are read.
+///
+/// Before building the predicate, the filters' current value goes through
+/// [`rewrite_case_as_or`], so a partitioned hash join's routing `CASE` can prune too.
+/// DataFusion's `FilePruner` snapshots the dynamic filters itself and can't take a rewritten
+/// value, so this uses [`PruningPredicate`] directly and reproduces its change tracking: the
+/// predicate is rebuilt only when the filters' generation changes.
 pub(crate) struct PartitionFilePruner {
     predicate: Arc<dyn PhysicalExpr>,
     schema: SchemaRef,
+    /// The pruning predicate built for a generation of `predicate`, `None` when it can't
+    /// prune.
+    cached: Mutex<Option<(u64, Option<Arc<PruningPredicate>>)>>,
 }
 
 impl PartitionFilePruner {
@@ -41,23 +51,45 @@ impl PartitionFilePruner {
         Some(Self {
             predicate: conjunction(dynamic),
             schema: Arc::clone(schema),
+            cached: Mutex::new(None),
         })
     }
 
     /// Whether `task`'s file can be skipped: `true` only if no row in it can pass the filters.
     pub(crate) fn should_skip(&self, task: &FileScanTask) -> bool {
-        let statistics = file_statistics(task, &self.schema);
-        let file = PartitionedFile::new(task.data_file_path(), task.file_size_in_bytes())
-            .with_statistics(Arc::new(statistics));
-        let Some(mut pruner) = FilePruner::try_new(
-            Arc::clone(&self.predicate),
-            &self.schema,
-            &file,
-            Count::new(),
-        ) else {
+        let Some(pruning_predicate) = self.pruning_predicate() else {
             return false;
         };
-        pruner.should_prune().unwrap_or(false)
+        let statistics = PrunableStatistics::new(
+            vec![Arc::new(file_statistics(task, &self.schema))],
+            Arc::clone(&self.schema),
+        );
+        match pruning_predicate.prune(&statistics) {
+            Ok(keep) => keep.iter().all(|keep| !keep),
+            Err(_) => false,
+        }
+    }
+
+    /// The pruning predicate for the filters' current value, rebuilt only when their
+    /// generation changed since the last call. The generation is read before the value, so
+    /// the cached predicate is never older than its generation.
+    fn pruning_predicate(&self) -> Option<Arc<PruningPredicate>> {
+        let generation = snapshot_generation(&self.predicate);
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_generation, predicate)) = cached.as_ref()
+            && *cached_generation == generation
+        {
+            return predicate.clone();
+        }
+        let predicate = snapshot_physical_expr(Arc::clone(&self.predicate))
+            .ok()
+            .and_then(|current| {
+                PruningPredicateBuilder::new()
+                    .with_file_schema(Arc::clone(&self.schema))
+                    .build(rewrite_case_as_or(&current))
+            });
+        *cached = Some((generation, predicate.clone()));
+        predicate
     }
 }
 

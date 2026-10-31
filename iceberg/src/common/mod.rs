@@ -2,6 +2,7 @@ mod error;
 
 pub(crate) use error::{df_err, iceberg_err};
 
+pub(crate) mod case_as_or;
 mod file_partition;
 pub(crate) mod kept_filters;
 pub(crate) mod partition_pruning;
