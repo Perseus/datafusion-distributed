@@ -6,6 +6,7 @@ mod tests {
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::error::Result;
     use datafusion::execution::SessionStateBuilder;
+    use datafusion::physical_plan::joins::HashJoinExec;
     use datafusion::physical_plan::{collect, displayable};
     use datafusion_distributed::DistributedExt;
     use datafusion_distributed_iceberg::{IcebergExt, IcebergIntegrationOptions};
@@ -253,6 +254,215 @@ mod tests {
     const SEMI_JOIN_QUERY: &str = r"SELECT COUNT(*) AS trips
         FROM taxi
         WHERE pickup_date IN (SELECT DISTINCT pickup_date FROM taxi WHERE pickup_date = DATE '2024-01-10')";
+
+    /// A partitioned hash join builds one filter per build partition and routes each probe row
+    /// to its partition's filter with a `CASE` on the row's hash. With pruning on, that filter
+    /// still prunes row groups and skips whole files. The join's result is the same either way.
+    #[tokio::test]
+    async fn lazy_scan_prunes_with_partitioned_join_filter() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let off_run = run_partitioned_join(&off).await?;
+        let on_run = run_partitioned_join(&on).await?;
+
+        insta::assert_snapshot!(off_run.join_mode, @"Partitioned");
+        insta::assert_snapshot!(
+            format!("pruning off: {}\npruning on: {}", off_run.probe_rows, on_run.probe_rows),
+            @"
+        pruning off: 175000
+        pruning on: 75000
+        "
+        );
+        insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
+        data files read with pruning off: 9
+        data files read with pruning on: 5
+        ");
+        assert_eq!(off_run.result, on_run.result);
+        insta::assert_snapshot!(on_run.result, @"
+        +-------+
+        | trips |
+        +-------+
+        | 50000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Like [lazy_scan_prunes_with_partitioned_join_filter], for a scan whose files are planned
+    /// eagerly.
+    #[tokio::test]
+    async fn eager_scan_prunes_with_partitioned_join_filter() -> Result<()> {
+        let off_storage = CountingStorageFactory::new();
+        let off = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&off_storage))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .build()
+            .await?;
+        let on_storage = CountingStorageFactory::new();
+        let on = IcebergTestHarness::builder()
+            .with_session_extension(iceberg_integration(&on_storage))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let off_run = run_partitioned_join(&off).await?;
+        let on_run = run_partitioned_join(&on).await?;
+
+        insta::assert_snapshot!(off_run.join_mode, @"Partitioned");
+        insta::assert_snapshot!(
+            format!("pruning off: {}\npruning on: {}", off_run.probe_rows, on_run.probe_rows),
+            @"
+        pruning off: 175000
+        pruning on: 75000
+        "
+        );
+        insta::assert_snapshot!(data_file_reads(&off_storage, &on_storage), @"
+        data files read with pruning off: 9
+        data files read with pruning on: 5
+        ");
+        assert_eq!(off_run.result, on_run.result);
+        insta::assert_snapshot!(on_run.result, @"
+        +-------+
+        | trips |
+        +-------+
+        | 50000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Distributed, the coordinator ORs together the routing filters of every producer task.
+    /// Worker probe scans may start before that filter has a value, so only the result is
+    /// checked.
+    #[tokio::test]
+    async fn distributed_partitioned_join_with_pruning_returns_same_rows() -> Result<()> {
+        let (_, batches) = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(create_taxi_table().await?)
+            .with_workers(2)
+            .with_config_option("datafusion.execution.target_partitions", 4)
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .with_config_option(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            )
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .query(PARTITIONED_JOIN_QUERY)
+            .await?;
+
+        insta::assert_snapshot!(batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 50000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// Keeps the trips on the two days the build side selects. Without DISTINCT the build side
+    /// isn't small, so with the single-partition thresholds at 0 the join is partitioned.
+    const PARTITIONED_JOIN_QUERY: &str = r"SELECT COUNT(*) AS trips
+        FROM taxi
+        WHERE pickup_date IN (
+            SELECT pickup_date FROM taxi
+            WHERE pickup_date IN (DATE '2024-01-10', DATE '2024-01-12')
+        )";
+
+    struct PartitionedJoinRun {
+        /// The hash join's `mode=` in the plan.
+        join_mode: String,
+        /// Rows output by the join's probe-side scan.
+        probe_rows: usize,
+        result: String,
+    }
+
+    /// Runs [PARTITIONED_JOIN_QUERY] and reports the join mode, the probe scan's output rows
+    /// and the result.
+    async fn run_partitioned_join(harness: &IcebergTestHarness) -> Result<PartitionedJoinRun> {
+        let plan = harness.physical_plan(PARTITIONED_JOIN_QUERY).await?;
+        let batches = collect(Arc::clone(&plan), harness.state().task_ctx()).await?;
+        let mut join_mode = String::new();
+        let mut probe_rows = 0;
+        plan.apply(|node| {
+            let Some(join) = node.downcast_ref::<HashJoinExec>() else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            join_mode = format!("{:?}", join.mode);
+            join.right().apply(|probe| {
+                if probe.downcast_ref::<DataSourceExec>().is_none() {
+                    return Ok(TreeNodeRecursion::Continue);
+                }
+                probe_rows = probe
+                    .metrics()
+                    .and_then(|m| m.output_rows())
+                    .unwrap_or_default();
+                Ok(TreeNodeRecursion::Stop)
+            })?;
+            Ok(TreeNodeRecursion::Stop)
+        })?;
+        Ok(PartitionedJoinRun {
+            join_mode,
+            probe_rows,
+            result: datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+        })
+    }
 
     /// Registers the Iceberg integration reading files through `storage`.
     fn iceberg_integration(

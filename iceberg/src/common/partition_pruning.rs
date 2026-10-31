@@ -4,12 +4,14 @@
 use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use datafusion::common::stats::Precision;
 use datafusion::common::pruning::PrunableStatistics;
+use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_expr::{PhysicalExpr, conjunction};
-use datafusion::physical_expr_common::physical_expr::{snapshot_generation, snapshot_physical_expr};
+use datafusion::physical_expr_common::physical_expr::{
+    snapshot_generation, snapshot_physical_expr,
+};
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Transform, Type};

@@ -23,8 +23,8 @@ use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{
-    BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr, Literal,
-    NotExpr,
+    BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr,
+    Literal, NotExpr,
 };
 use iceberg::expr::{Predicate, Reference};
 
@@ -473,7 +473,11 @@ mod tests {
     fn case_without_else_leaves_the_else_out() {
         let schema = iceberg_schema();
         // A missing ELSE yields NULL, which never passes a filter.
-        let filter = case(None, vec![(lit(true), lt_id(1)), (lit(false), gt_id(9))], None);
+        let filter = case(
+            None,
+            vec![(lit(true), lt_id(1)), (lit(false), gt_id(9))],
+            None,
+        );
         assert_snapshot!(show(&filter, &schema), @"(id < 1) OR (id > 9)");
     }
 
