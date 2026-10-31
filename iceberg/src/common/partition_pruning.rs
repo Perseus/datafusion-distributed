@@ -49,9 +49,12 @@ impl PartitionFilePruner {
         let statistics = file_statistics(task, &self.schema);
         let file = PartitionedFile::new(task.data_file_path(), task.file_size_in_bytes())
             .with_statistics(Arc::new(statistics));
-        let Some(mut pruner) =
-            FilePruner::try_new(Arc::clone(&self.predicate), &self.schema, &file, Count::new())
-        else {
+        let Some(mut pruner) = FilePruner::try_new(
+            Arc::clone(&self.predicate),
+            &self.schema,
+            &file,
+            Count::new(),
+        ) else {
             return false;
         };
         pruner.should_prune().unwrap_or(false)
@@ -197,4 +200,168 @@ fn literal_to_scalar(
         _ => return None,
     };
     Some(scalar)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{Field, Schema as ArrowSchema};
+    use iceberg::arrow::schema_to_arrow_schema;
+    use iceberg::spec::{DataFileFormat, NestedField, PartitionSpec, Schema, Struct};
+
+    #[test]
+    fn identity_partition_value_is_exact_bounds() {
+        let task = task(
+            spec(&[("day", Transform::Identity)]),
+            [Some(Literal::date(19732))],
+        );
+
+        insta::assert_snapshot!(describe(&task, &output_schema()), @"
+        rows=Exact(10)
+        id: unknown
+        day: min=Exact(Date32(\"2024-01-10\")) max=Exact(Date32(\"2024-01-10\")) nulls=Exact(0)
+        name: unknown
+        ");
+    }
+
+    #[test]
+    fn non_identity_transform_is_ignored() {
+        let task = task(
+            spec(&[("id", Transform::Bucket(4))]),
+            [Some(Literal::int(1))],
+        );
+
+        insta::assert_snapshot!(describe(&task, &output_schema()), @"
+        rows=Exact(10)
+        id: unknown
+        day: unknown
+        name: unknown
+        ");
+    }
+
+    #[test]
+    fn null_partition_value_means_all_nulls() {
+        let task = task(spec(&[("name", Transform::Identity)]), [None]);
+
+        insta::assert_snapshot!(describe(&task, &output_schema()), @"
+        rows=Exact(10)
+        id: unknown
+        day: unknown
+        name: min=Absent max=Absent nulls=Exact(10)
+        ");
+    }
+
+    /// Each file is described by its own spec: an older file partitioned by `id` and a newer
+    /// one partitioned by `name` describe different columns.
+    #[test]
+    fn each_file_uses_its_own_partition_spec() {
+        let old = task(
+            spec(&[("id", Transform::Identity)]),
+            [Some(Literal::int(7))],
+        );
+        let new = task(
+            spec(&[("name", Transform::Identity)]),
+            [Some(Literal::string("a"))],
+        );
+
+        insta::assert_snapshot!(describe(&old, &output_schema()), @"
+        rows=Exact(10)
+        id: min=Exact(Int32(7)) max=Exact(Int32(7)) nulls=Exact(0)
+        day: unknown
+        name: unknown
+        ");
+        insta::assert_snapshot!(describe(&new, &output_schema()), @"
+        rows=Exact(10)
+        id: unknown
+        day: unknown
+        name: min=Exact(Utf8(\"a\")) max=Exact(Utf8(\"a\")) nulls=Exact(0)
+        ");
+    }
+
+    /// The output reads `id` as Int64, which doesn't match the Iceberg Int partition value.
+    #[test]
+    fn type_mismatch_is_left_unknown() {
+        let task = task(
+            spec(&[("id", Transform::Identity)]),
+            [Some(Literal::int(7))],
+        );
+        let mut fields: Vec<Field> = output_schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields[0] = fields[0].clone().with_data_type(DataType::Int64);
+        let output = Arc::new(ArrowSchema::new(fields));
+
+        insta::assert_snapshot!(describe(&task, &output), @"
+        rows=Exact(10)
+        id: unknown
+        day: unknown
+        name: unknown
+        ");
+    }
+
+    fn table_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "day", Type::Primitive(PrimitiveType::Date)).into(),
+                    NestedField::optional(3, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn output_schema() -> SchemaRef {
+        Arc::new(schema_to_arrow_schema(&table_schema()).unwrap())
+    }
+
+    fn spec(fields: &[(&str, Transform)]) -> Arc<PartitionSpec> {
+        let mut builder = PartitionSpec::builder(table_schema());
+        for (column, transform) in fields {
+            builder = builder
+                .add_partition_field(*column, format!("{column}_part"), *transform)
+                .unwrap();
+        }
+        Arc::new(builder.build().unwrap())
+    }
+
+    fn task<const N: usize>(
+        spec: Arc<PartitionSpec>,
+        values: [Option<Literal>; N],
+    ) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_record_count(Some(10))
+            .with_data_file_path("file:///t/data/f.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table_schema())
+            .with_project_field_ids(vec![1, 2, 3])
+            .with_partition(Some(Struct::from_iter(values)))
+            .with_partition_spec(Some(spec))
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
+    }
+
+    fn describe(task: &FileScanTask, schema: &SchemaRef) -> String {
+        let stats = file_statistics(task, schema);
+        let mut lines = vec![format!("rows={:?}", stats.num_rows)];
+        for (field, column) in schema.fields().iter().zip(&stats.column_statistics) {
+            let line = if column == &ColumnStatistics::new_unknown() {
+                "unknown".to_string()
+            } else {
+                format!(
+                    "min={:?} max={:?} nulls={:?}",
+                    column.min_value, column.max_value, column.null_count
+                )
+            };
+            lines.push(format!("{}: {line}", field.name()));
+        }
+        lines.join("\n")
+    }
 }
