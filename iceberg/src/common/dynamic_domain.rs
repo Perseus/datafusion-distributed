@@ -96,10 +96,11 @@ impl CompactedDynamicFilters {
     /// The compacted expression for the filters' current value, with the generation it was
     /// built for. It is rebuilt only when the generation changed since the last call. The
     /// generation is read before the value, so the expression is never older than its
-    /// generation.
+    /// generation. It is read under the lock, so a caller delayed on the lock can't replace a
+    /// newer cached expression with one tagged by an older generation.
     pub(crate) fn current(&self) -> (u64, Arc<dyn PhysicalExpr>) {
-        let generation = self.generation();
         let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = self.generation();
         if let Some((cached_generation, expr)) = cached.as_ref()
             && *cached_generation == generation
         {
@@ -793,6 +794,38 @@ mod tests {
         let (_, second) = compacted.current();
         assert!(!Arc::ptr_eq(&first, &second));
         assert_snapshot!(second, @"id@0 >= 1 AND id@0 <= 2");
+    }
+
+    /// A caller that waits on the cache while the filter is updated and recompacted by another
+    /// caller must reuse that newer expression, not overwrite it with an older generation's.
+    #[test]
+    fn caller_delayed_on_the_cache_reuses_the_newer_expression() {
+        let schema = Arc::new(schema());
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![col("id")], lit(true)));
+        let compacted = Arc::new(
+            CompactedDynamicFilters::try_new(&[Arc::clone(&dynamic) as _], &schema, 150).unwrap(),
+        );
+
+        let held = compacted.cached.lock().unwrap();
+        let delayed = {
+            let compacted = Arc::clone(&compacted);
+            std::thread::spawn(move || compacted.current())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // While the delayed caller waits, the filter is updated and another caller caches it.
+        dynamic.update(bounds("id", 1, 2)).unwrap();
+        let mut held = held;
+        let newer = compact(&dynamic.current().unwrap(), &schema, 150);
+        *held = Some((compacted.generation(), Arc::clone(&newer)));
+        drop(held);
+
+        let (generation, expr) = delayed.join().unwrap();
+        assert_eq!(generation, compacted.generation());
+        assert!(Arc::ptr_eq(&expr, &newer));
+        assert_eq!(
+            compacted.cached.lock().unwrap().as_ref().unwrap().0,
+            compacted.generation()
+        );
     }
 
     fn show(expr: &Arc<dyn PhysicalExpr>, max_values: usize) -> String {
