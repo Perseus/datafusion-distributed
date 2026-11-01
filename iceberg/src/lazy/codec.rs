@@ -178,6 +178,7 @@ mod tests {
     use iceberg::table::Table;
 
     use datafusion::physical_expr::expressions::lit;
+    use datafusion::physical_plan::displayable;
 
     use super::*;
     use crate::common::df_err;
@@ -240,6 +241,8 @@ mod tests {
             properties.get("fixture.region").map(String::as_str),
             Some("test-region")
         );
+        // With filters disabled, a limited scan decoded on a worker displays as on main.
+        insta::assert_snapshot!(displayable(decoded_plan.as_ref()).one_line(), @"DataSourceExec: format=iceberg");
         assert_eq!(
             decoded.partition_statistics(None)?.as_ref(),
             &Statistics::new_unknown(&decoded.scan.schema)
