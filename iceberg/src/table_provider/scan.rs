@@ -1,4 +1,5 @@
 use crate::common::df_err;
+use crate::common::partition_pruning::column_stats_columns;
 use crate::common::scan_config::ScanConfig;
 use crate::eager::assign_files;
 use crate::eager::planned_files::PlannedFiles;
@@ -60,6 +61,22 @@ pub(crate) async fn plan_scan(
             .unwrap_or_else(iceberg::Runtime::current),
         &context,
     );
+    // Per-file manifest column statistics let the scan skip files by their column bounds, so
+    // they are requested only when dynamic filter pruning is on. The setting is read here, when
+    // the scan is planned, like the kept filters it serves (see `try_pushdown_filters`), and the
+    // same column list is used by the eager and lazy file listings. With the setting off nothing
+    // is requested and file tasks are unchanged. Not to be confused with
+    // `iceberg.column_stats_enabled`, which computes table-level statistics for the planner.
+    let file_column_stats =
+        if IcebergConfig::from_task_context(&context).dynamic_filter_pruning_enabled {
+            let schema = match &table_snapshot {
+                Some(snap) => snap.schema(table.metadata()).map_err(df_err)?,
+                None => table.metadata().current_schema().clone(),
+            };
+            Some(column_stats_columns(&schema, projection.as_deref()))
+        } else {
+            None
+        };
     let planned = if IcebergConfig::from_task_context(&context).eager_file_planning {
         if partitioning.partition_count() == 0 {
             return config_err!("Iceberg scan requires at least one output partition");
@@ -73,6 +90,9 @@ pub(crate) async fn plan_scan(
         }
         if let Some(predicates) = &predicates {
             builder = builder.with_filter(predicates.clone());
+        }
+        if let Some(columns) = &file_column_stats {
+            builder = builder.with_column_stats(columns.clone());
         }
         let table_scan = builder.build().map_err(df_err)?;
         // File discovery runs on Iceberg's I/O runtime and is canceled if planning is dropped.
@@ -130,6 +150,7 @@ pub(crate) async fn plan_scan(
         snapshot_id: opts.snapshot_id,
         projection,
         predicates,
+        column_stats: file_column_stats,
         partitioning,
         sync_manager: Default::default(),
     });

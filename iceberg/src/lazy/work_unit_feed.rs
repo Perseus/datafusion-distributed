@@ -177,6 +177,10 @@ pub struct IcebergWorkUnitFeed {
     pub(crate) projection: Option<Vec<String>>,
     /// Filters to apply to the table scan.
     pub(crate) predicates: Option<Predicate>,
+    /// Columns whose manifest statistics (bounds, null and NaN counts) each file task carries,
+    /// so workers can skip files by column bounds. `None` requests none. Set when the scan is
+    /// planned with `iceberg.dynamic_filter_pruning_enabled`.
+    pub(crate) column_stats: Option<Vec<String>>,
     /// Partitioning scheme to which the feeds should adhere.
     /// TODO: Today, only Partitioning::UnknownPartitioning partitioning is supported.
     ///  Ideally, both Range partitioning and hash partitioning should be supported.
@@ -193,6 +197,7 @@ impl Clone for IcebergWorkUnitFeed {
             snapshot_id: self.snapshot_id,
             projection: self.projection.clone(),
             predicates: self.predicates.clone(),
+            column_stats: self.column_stats.clone(),
             partitioning: self.partitioning.clone(),
             sync_manager: Default::default(),
         }
@@ -233,6 +238,9 @@ impl WorkUnitFeedProvider for IcebergWorkUnitFeed {
             };
             if let Some(pred) = &self.predicates {
                 scan_builder = scan_builder.with_filter(pred.clone());
+            }
+            if let Some(columns) = &self.column_stats {
+                scan_builder = scan_builder.with_column_stats(columns.clone());
             }
             let table_scan = scan_builder.build().map_err(df_err)?;
 
@@ -302,5 +310,68 @@ impl WorkUnitFeedProvider for IcebergWorkUnitFeed {
                 let _ = &task_ref; // Keep the task alive as long as one feed is alive.
             })
             .boxed())
+    }
+}
+
+// Iceberg's column statistics are built from std's `HashMap`.
+#[cfg(test)]
+#[allow(clippy::disallowed_types)]
+mod tests {
+    use std::collections::HashMap;
+
+    use iceberg::scan::FileScanTaskColumnStats;
+    use iceberg::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
+
+    use super::*;
+
+    /// Workers receive file tasks serialized, and skip files by the column statistics they
+    /// carry, so the statistics must arrive unchanged. Eagerly planned files are sent with the
+    /// same serialization.
+    #[test]
+    fn column_stats_survive_serialization() -> Result<()> {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "day", Type::Primitive(PrimitiveType::Date)).into(),
+                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "score", Type::Primitive(PrimitiveType::Double)).into(),
+            ])
+            .build()
+            .unwrap();
+        let stats = FileScanTaskColumnStats::builder()
+            .with_value_counts(HashMap::from([(1, 10), (2, 10), (3, 10)]))
+            .with_null_value_counts(HashMap::from([(1, 0), (2, 3)]))
+            .with_nan_value_counts(HashMap::from([(3, 0)]))
+            .with_lower_bounds(HashMap::from([
+                (1, Datum::date(19730)),
+                (2, Datum::string("abc")),
+                (3, Datum::double(-0.0)),
+            ]))
+            .with_upper_bounds(HashMap::from([
+                (1, Datum::date(19736)),
+                (2, Datum::string("abd")),
+                (3, Datum::double(2.5)),
+            ]))
+            .build();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_record_count(Some(10))
+            .with_data_file_path("file:///t/data/f.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(schema))
+            .with_project_field_ids(vec![1, 2, 3])
+            .with_column_stats(Some(stats.clone()))
+            .with_case_sensitive(true)
+            .build()
+            .unwrap();
+
+        let bytes = FileScanTaskWorkUnit::new(task).encode_to_vec();
+        let received = FileScanTaskWorkUnit::decode(bytes.as_slice())
+            .map_err(|e| exec_datafusion_err!("{e}"))?
+            .into_task()?;
+
+        assert_eq!(received.column_stats(), Some(&stats));
+        Ok(())
     }
 }

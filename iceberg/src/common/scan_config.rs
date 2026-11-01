@@ -1,5 +1,5 @@
 use crate::common::dynamic_domain::CompactedDynamicFilters;
-use crate::common::partition_pruning::PartitionFilePruner;
+use crate::common::partition_pruning::{PartitionFilePruner, SkipReason};
 use crate::common::runtime_predicate::DynamicFilterPredicateProvider;
 use crate::{IcebergConfig, common::df_err};
 use datafusion::arrow::datatypes::SchemaRef;
@@ -109,8 +109,10 @@ impl ScanConfig {
     /// Reads `tasks`. `filters` are the source's kept filters, against [`Self::schema`].
     ///
     /// When `iceberg.dynamic_filter_pruning_enabled` is set and some of them are dynamic, data
-    /// files whose identity partition values can't match the dynamic filters are dropped from
-    /// `tasks` before the reader sees them, and counted in the `files_skipped` metric. Each
+    /// files whose identity partition values or manifest column bounds can't match the dynamic
+    /// filters are dropped from `tasks` before the reader sees them. `files_skipped` counts every
+    /// skipped file; `files_skipped_by_bounds` counts the subset that only the column bounds
+    /// ruled out, so `files_skipped - files_skipped_by_bounds` were skipped by partition. Each
     /// task is checked when the reader pulls it, with the filters' value at that time. The
     /// reader pulls up to `iceberg.data_file_concurrency_limit` tasks ahead of the files it
     /// is reading, so a filter that tightens later doesn't skip tasks already pulled: it only
@@ -129,13 +131,18 @@ impl ScanConfig {
             Some((pruner, reader)) => {
                 let files_skipped =
                     MetricBuilder::new(&self.metrics).counter("files_skipped", partition);
+                let files_skipped_by_bounds =
+                    MetricBuilder::new(&self.metrics).counter("files_skipped_by_bounds", partition);
                 let tasks = tasks
                     .filter(move |task| {
-                        let skip = task.as_ref().is_ok_and(|task| pruner.should_skip(task));
-                        if skip {
+                        let reason = task.as_ref().ok().and_then(|task| pruner.skip_reason(task));
+                        if let Some(reason) = reason {
                             files_skipped.add(1);
+                            if reason == SkipReason::ColumnBounds {
+                                files_skipped_by_bounds.add(1);
+                            }
                         }
-                        future::ready(!skip)
+                        future::ready(reason.is_none())
                     })
                     .boxed();
                 (tasks, reader)
