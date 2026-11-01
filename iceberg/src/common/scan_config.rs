@@ -1,5 +1,6 @@
 use crate::common::dynamic_domain::CompactedDynamicFilters;
 use crate::common::partition_pruning::PartitionFilePruner;
+use crate::common::runtime_predicate::DynamicFilterPredicateProvider;
 use crate::{IcebergConfig, common::df_err};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::stats::Precision;
@@ -31,16 +32,26 @@ pub(crate) struct ScanConfig {
     pub(crate) iceberg_runtime: iceberg::Runtime,
     // Clones share the delete loader across this source's local partitions.
     reader: ArrowReader,
+    /// Builds a reader with the same settings as `reader`, for one that also takes the dynamic
+    /// filters as a runtime predicate.
+    reader_builder: Arc<dyn Fn() -> ArrowReaderBuilder + Send + Sync>,
     /// The session's `hash_join_inlist_pushdown_max_distinct_values` when
     /// `iceberg.dynamic_filter_pruning_enabled` is set, `None` otherwise.
     dynamic_filter_max_values: Option<usize>,
-    /// The file pruner shared by every partition this config opens, with the filters it was
-    /// built for. Clones share it; a clone opened with other filters replaces it.
-    file_pruner: Arc<Mutex<Option<SharedPruner>>>,
+    /// The session's `datafusion.execution.parquet.pushdown_filters`: whether the reader also
+    /// evaluates the dynamic filters row by row, not only to prune.
+    pushdown_filters: bool,
+    /// What every partition this config opens shares for its dynamic filters, with the filters
+    /// it was built for. Clones share it; a clone opened with other filters replaces it.
+    dynamic_filters: Arc<Mutex<Option<SharedDynamicFilters>>>,
 }
 
-/// A [`PartitionFilePruner`] and the kept filters it was built over.
-type SharedPruner = (Vec<Arc<dyn PhysicalExpr>>, Option<Arc<PartitionFilePruner>>);
+/// The kept filters a scan's dynamic-filter pruning was built over, the file pruner and the
+/// reader that prunes row groups and pages with them. `None` parts mean no dynamic filter.
+type SharedDynamicFilters = (
+    Vec<Arc<dyn PhysicalExpr>>,
+    Option<(Arc<PartitionFilePruner>, ArrowReader)>,
+);
 
 impl ScanConfig {
     pub(crate) fn new(
@@ -52,12 +63,27 @@ impl ScanConfig {
         context: &TaskContext,
     ) -> Self {
         let config = IcebergConfig::from_config_options(context.session_config().options());
-        let reader = ArrowReaderBuilder::new(iceberg_file_io.clone(), iceberg_runtime.clone())
-            .with_batch_size(context.session_config().batch_size())
-            .with_data_file_concurrency_limit(config.data_file_concurrency_limit)
-            .with_row_group_filtering_enabled(config.row_group_filtering_enabled)
-            .with_row_selection_enabled(config.row_selection_enabled)
-            .build();
+        let (file_io, runtime) = (iceberg_file_io.clone(), iceberg_runtime.clone());
+        let batch_size = context.session_config().batch_size();
+        let (concurrency, row_groups, row_selection) = (
+            config.data_file_concurrency_limit,
+            config.row_group_filtering_enabled,
+            config.row_selection_enabled,
+        );
+        let reader_builder = Arc::new(move || {
+            ArrowReaderBuilder::new(file_io.clone(), runtime.clone())
+                .with_batch_size(batch_size)
+                .with_data_file_concurrency_limit(concurrency)
+                .with_row_group_filtering_enabled(row_groups)
+                .with_row_selection_enabled(row_selection)
+        });
+        let reader = reader_builder().build();
+        let pushdown_filters = context
+            .session_config()
+            .options()
+            .execution
+            .parquet
+            .pushdown_filters;
         let dynamic_filter_max_values = config.dynamic_filter_pruning_enabled.then(|| {
             context
                 .session_config()
@@ -73,8 +99,10 @@ impl ScanConfig {
             iceberg_file_io,
             iceberg_runtime,
             reader,
+            reader_builder,
             dynamic_filter_max_values,
-            file_pruner: Default::default(),
+            pushdown_filters,
+            dynamic_filters: Default::default(),
         }
     }
 
@@ -87,17 +115,21 @@ impl ScanConfig {
     /// reader pulls up to `iceberg.data_file_concurrency_limit` tasks ahead of the files it
     /// is reading, so a filter that tightens later doesn't skip tasks already pulled: it only
     /// skips fewer files, never a file that could match.
+    ///
+    /// The same filters also prune each data file's row groups, and its pages when
+    /// `iceberg.row_selection_enabled` is set, with their value when the reader opens the file.
+    /// They filter rows inside the reader only with `datafusion.execution.parquet.pushdown_filters`.
     pub(crate) fn open(
         &self,
         tasks: FileScanTaskStream,
         filters: &[Arc<dyn PhysicalExpr>],
         partition: usize,
     ) -> Result<SendableRecordBatchStream> {
-        let tasks = match self.file_pruner(filters) {
-            Some(pruner) => {
+        let (tasks, reader) = match self.dynamic_filters(filters) {
+            Some((pruner, reader)) => {
                 let files_skipped =
                     MetricBuilder::new(&self.metrics).counter("files_skipped", partition);
-                tasks
+                let tasks = tasks
                     .filter(move |task| {
                         let skip = task.as_ref().is_ok_and(|task| pruner.should_skip(task));
                         if skip {
@@ -105,13 +137,12 @@ impl ScanConfig {
                         }
                         future::ready(!skip)
                     })
-                    .boxed()
+                    .boxed();
+                (tasks, reader)
             }
-            None => tasks,
+            None => (tasks, self.reader.clone()),
         };
-        let stream = self
-            .reader
-            .clone()
+        let stream = reader
             .read(tasks)
             .map(|result| result.stream())
             .map_err(df_err)?
@@ -129,25 +160,51 @@ impl ScanConfig {
 }
 
 impl ScanConfig {
-    /// The pruner for `filters`, built once and shared by every partition opened with the same
-    /// filters, so their dynamic filters are compacted once per change of their value. `None`
-    /// when pruning is disabled or no filter is dynamic.
-    fn file_pruner(&self, filters: &[Arc<dyn PhysicalExpr>]) -> Option<Arc<PartitionFilePruner>> {
+    /// The file pruner and the reader for `filters`, built once and shared by every partition
+    /// opened with the same filters, so their dynamic filters are compacted once per change of
+    /// their value for the whole scan, and the scan still has one reader. `None` when pruning is
+    /// disabled or no filter is dynamic; the scan then uses the reader built in [`Self::new`].
+    ///
+    /// The reader built in [`Self::new`] can't take the runtime predicate: the filters are only
+    /// known when a partition opens. So the first partition opened with dynamic filters builds a
+    /// second reader, with the same settings plus the predicate, and every partition uses it.
+    fn dynamic_filters(
+        &self,
+        filters: &[Arc<dyn PhysicalExpr>],
+    ) -> Option<(Arc<PartitionFilePruner>, ArrowReader)> {
         let max_values = self.dynamic_filter_max_values?;
-        let mut shared = self.file_pruner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((built_for, pruner)) = shared.as_ref()
+        let mut shared = self
+            .dynamic_filters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((built_for, built)) = shared.as_ref()
             && built_for.len() == filters.len()
             && built_for
                 .iter()
                 .zip(filters)
                 .all(|(a, b)| Arc::ptr_eq(a, b))
         {
-            return pruner.clone();
+            return built.clone();
         }
-        let pruner = CompactedDynamicFilters::try_new(filters, &self.schema, max_values)
-            .map(|compacted| Arc::new(PartitionFilePruner::new(Arc::new(compacted), &self.schema)));
-        *shared = Some((filters.to_vec(), pruner.clone()));
-        pruner
+        let built =
+            CompactedDynamicFilters::try_new(filters, &self.schema, max_values).map(|compacted| {
+                let compacted = Arc::new(compacted);
+                let pruner = Arc::new(PartitionFilePruner::new(
+                    Arc::clone(&compacted),
+                    &self.schema,
+                ));
+                let mut builder = (self.reader_builder)();
+                if let Some(provider) =
+                    DynamicFilterPredicateProvider::try_new(compacted, &self.schema)
+                {
+                    builder = builder
+                        .with_runtime_predicate_provider(Arc::new(provider))
+                        .with_runtime_predicate_row_filter(self.pushdown_filters);
+                }
+                (pruner, builder.build())
+            });
+        *shared = Some((filters.to_vec(), built.clone()));
+        built
     }
 }
 

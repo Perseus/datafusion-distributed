@@ -23,11 +23,15 @@ extensions_options! {
         /// send them to workers with the scan. Every filter is still reported as not pushed
         /// down. Kept dynamic filters skip data files whose identity partition values can't
         /// match them, checked with the filters' value when the reader takes each file and
-        /// counted in the scan's `files_skipped` metric; they don't yet filter rows or prune
-        /// within files. Static filters stay enforced by the `FilterExec` above the scan;
-        /// dynamic filters have no `FilterExec` and are enforced by the operator that created
-        /// them (the hash join probes its hash table, TopK and aggregates re-check their
-        /// threshold), so skipping only changes which files are read.
+        /// counted in the scan's `files_skipped` metric. When the reader opens a file, they
+        /// also prune its row groups, and its pages when `row_selection_enabled` is set, with
+        /// their value at that time. They are evaluated row by row inside the reader only when
+        /// `datafusion.execution.parquet.pushdown_filters` is set, as DataFusion's Parquet scan
+        /// does; otherwise rows in the surviving row groups and pages are returned unfiltered.
+        /// Static filters stay enforced by the `FilterExec` above the scan; dynamic filters
+        /// have no `FilterExec` and are enforced by the operator that created them (the hash
+        /// join probes its hash table, TopK and aggregates re-check their threshold), so
+        /// pruning only changes what is read, never the result.
         pub dynamic_filter_pruning_enabled: bool, default = false
     }
 }
