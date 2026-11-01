@@ -6,7 +6,8 @@ use datafusion::common::{Result, Statistics};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use futures::TryStreamExt;
-use iceberg::scan::{FileScanTask, TableScan};
+use iceberg::scan::{FileScanTask, FileScanTaskColumnStats, TableScan};
+use iceberg::spec::{Datum, PrimitiveLiteral};
 
 use crate::common::df_err;
 
@@ -93,5 +94,97 @@ fn retained_size(task: &FileScanTask) -> usize {
             .saturating_add(delete.equality_ids().map_or(0, size_of_val))
             .saturating_add(delete.key_metadata().map_or(0, <[u8]>::len));
     }
+    if let Some(stats) = task.column_stats() {
+        bytes = bytes.saturating_add(column_stats_size(stats));
+    }
     bytes
+}
+
+/// The boxed per-file column statistics: their maps' entries and the bounds' string and binary
+/// payloads. Map overhead beyond the entries is covered by the caller's capacity allowance.
+fn column_stats_size(stats: &FileScanTaskColumnStats) -> usize {
+    let counts = [
+        stats.column_sizes(),
+        stats.value_counts(),
+        stats.null_value_counts(),
+        stats.nan_value_counts(),
+    ]
+    .iter()
+    .map(|counts| counts.len() * size_of::<(i32, u64)>())
+    .sum::<usize>();
+    let bounds = [stats.lower_bounds(), stats.upper_bounds()]
+        .iter()
+        .flat_map(|bounds| bounds.values())
+        .map(|bound| {
+            size_of::<(i32, Datum)>()
+                + match bound.literal() {
+                    PrimitiveLiteral::String(s) => s.len(),
+                    PrimitiveLiteral::Binary(b) => b.len(),
+                    _ => 0,
+                }
+        })
+        .sum::<usize>();
+    size_of::<FileScanTaskColumnStats>() + counts + bounds
+}
+
+// Iceberg's column statistics are built from std's `HashMap`.
+#[cfg(test)]
+#[allow(clippy::disallowed_types)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+
+    use super::*;
+
+    /// Planned files are retained until execution, so the column statistics they carry for
+    /// skipping files by bounds must count against the memory limit. Under a 64 KiB limit the
+    /// file task alone fits, but with 100 KB string bounds it is rejected.
+    #[test]
+    fn column_stats_count_against_the_memory_limit() -> Result<()> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(64 * 1024)))
+            .build_arc()?;
+        let context = TaskContext::default().with_runtime(runtime);
+        let long = "x".repeat(50_000);
+        let stats = FileScanTaskColumnStats::builder()
+            .with_lower_bounds(HashMap::from([(1, Datum::string(&long))]))
+            .with_upper_bounds(HashMap::from([(1, Datum::string(&long))]))
+            .build();
+
+        let without_stats = PlannedFiles::from_tasks(vec![task(None)], &context);
+        let with_stats = PlannedFiles::from_tasks(vec![task(Some(stats))], &context);
+
+        assert!(without_stats.is_ok());
+        insta::assert_snapshot!(
+            with_stats.unwrap_err().to_string().lines().next().unwrap_or_default(),
+            @"Resources exhausted: Failed to allocate additional 196.9 KB for Iceberg file planning with 0.0 B already allocated for this reservation - 63.2 KB remain available for the total memory pool: greedy(used: 792.0 B, pool_size: 64.0 KB)"
+        );
+        Ok(())
+    }
+
+    fn task(stats: Option<FileScanTaskColumnStats>) -> FileScanTask {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_record_count(Some(10))
+            .with_data_file_path("file:///t/data/f.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(schema))
+            .with_project_field_ids(vec![1])
+            .with_column_stats(stats)
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
+    }
 }
