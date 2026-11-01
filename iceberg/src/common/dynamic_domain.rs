@@ -53,9 +53,12 @@
 //! can widen a later, tighter value more than an earlier one: a float bound that moves to NaN
 //! or zero constrains nothing (TopK's `price < 1.0` compacts to `price <= 1.0`, its later
 //! `price < 0.0` to `true`), and a union of value sets that crosses the cap becomes a range.
-//! A consumer that skips data must therefore guard against a looser compacted value itself,
-//! for example by keeping what it already skipped skipped, or by intersecting each new value
-//! with the previous one, which is sound because the filters only tighten.
+//! [`CompactedDynamicFilters`] therefore latches: it intersects each newly compacted domain
+//! with the one it published before, which is sound because the filters only tighten, so the
+//! value it publishes only tightens too. A per-file skip decision would be safe without the
+//! latch, since each one uses a value covering every row the filters keep at that time and
+//! later values keep a subset of those rows; the latch exists so that consumers which keep
+//! reading one value while the filters change see it only tighten.
 //!
 //! Literals are used only when their type is exactly the column's, and float NaN and zero
 //! literals constrain nothing, so float comparisons never depend on how NaN or the sign of
@@ -77,7 +80,9 @@ use datafusion::physical_expr_common::physical_expr::{
     snapshot_generation, snapshot_physical_expr,
 };
 
-/// A scan's kept dynamic filters, compacted with [`compact`] once per change of their value.
+/// A scan's kept dynamic filters, compacted into per-column domains once per change of their value,
+/// and latched: each compacted domain is intersected with the previously published one, so
+/// the published value only tightens (see the module documentation).
 ///
 /// The cache sits behind a lock, so one instance can be shared (in an `Arc`) by every
 /// partition of a scan and still compacts once per generation; each instance it is built for
@@ -87,8 +92,15 @@ pub(crate) struct CompactedDynamicFilters {
     filters: Arc<dyn PhysicalExpr>,
     schema: Arc<Schema>,
     max_values: usize,
-    /// The compacted expression for a generation of `filters`.
-    cached: Mutex<Option<(u64, Arc<dyn PhysicalExpr>)>>,
+    /// The latched domain and its expression for a generation of `filters`.
+    cached: Mutex<Option<Published>>,
+}
+
+/// The value [`CompactedDynamicFilters`] published for one generation of its filters.
+struct Published {
+    generation: u64,
+    domain: Domain,
+    expr: Arc<dyn PhysicalExpr>,
 }
 
 impl CompactedDynamicFilters {
@@ -118,25 +130,39 @@ impl CompactedDynamicFilters {
         snapshot_generation(&self.filters)
     }
 
-    /// The compacted expression for the filters' current value, with the generation it was
-    /// built for. It is rebuilt only when the generation changed since the last call. The
-    /// generation is read before the value, so the expression is never older than its
-    /// generation. It is read under the lock, so a caller delayed on the lock can't replace a
-    /// newer cached expression with one tagged by an older generation.
+    /// The compacted expression for the filters' current value, intersected with every value
+    /// published before, with the generation it was built for. It is rebuilt only when the
+    /// generation changed since the last call. The generation is read before the value, so the
+    /// expression is never older than its generation. It is read under the lock, so a caller
+    /// delayed on the lock can't replace a newer cached expression with one tagged by an older
+    /// generation.
     pub(crate) fn current(&self) -> (u64, Arc<dyn PhysicalExpr>) {
         let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
         let generation = self.generation();
-        if let Some((cached_generation, expr)) = cached.as_ref()
-            && *cached_generation == generation
+        if let Some(published) = cached.as_ref()
+            && published.generation == generation
         {
-            return (generation, Arc::clone(expr));
+            return (generation, Arc::clone(&published.expr));
         }
-        let expr = match snapshot_physical_expr(Arc::clone(&self.filters)) {
-            Ok(current) => compact(&current, &self.schema, self.max_values),
-            // Fail open: no constraint.
-            Err(_) => lit(true),
+        let compactor = Compactor {
+            schema: &self.schema,
+            max_values: self.max_values,
         };
-        *cached = Some((generation, Arc::clone(&expr)));
+        let domain = match snapshot_physical_expr(Arc::clone(&self.filters)) {
+            Ok(current) => compactor.domain(&current),
+            // Fail open: no constraint.
+            Err(_) => Domain::all(),
+        };
+        let domain = match cached.take() {
+            Some(previous) => previous.domain.intersect(domain),
+            None => domain,
+        };
+        let expr = domain.clone().into_expr(&self.schema);
+        *cached = Some(Published {
+            generation,
+            domain,
+            expr: Arc::clone(&expr),
+        });
         (generation, expr)
     }
 }
@@ -159,6 +185,7 @@ pub(crate) fn dynamic_conjuncts(filters: &[Arc<dyn PhysicalExpr>]) -> Vec<Arc<dy
 /// [`Domain::into_expr`]. Value sets larger than `max_values` are reduced to their range.
 ///
 /// `expr` must be used where widening it is safe, see the module documentation.
+#[cfg(test)]
 pub(crate) fn compact(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
@@ -936,16 +963,118 @@ mod tests {
         dynamic.update(bounds("id", 1, 2)).unwrap();
         let mut held = held;
         let newer = compact(&dynamic.current().unwrap(), &schema, 150);
-        *held = Some((compacted.generation(), Arc::clone(&newer)));
+        *held = Some(Published {
+            generation: compacted.generation(),
+            domain: Domain::all(),
+            expr: Arc::clone(&newer),
+        });
         drop(held);
 
         let (generation, expr) = delayed.join().unwrap();
         assert_eq!(generation, compacted.generation());
         assert!(Arc::ptr_eq(&expr, &newer));
         assert_eq!(
-            compacted.cached.lock().unwrap().as_ref().unwrap().0,
+            compacted
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
             compacted.generation()
         );
+    }
+
+    /// Feeds `values` to one dynamic filter in turn and returns what consumers see after each.
+    fn published_after(values: Vec<Arc<dyn PhysicalExpr>>, max_values: usize) -> String {
+        let schema = Arc::new(schema());
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col("id"), col("price")],
+            lit(true),
+        ));
+        let compacted =
+            CompactedDynamicFilters::try_new(&[Arc::clone(&dynamic) as _], &schema, max_values)
+                .unwrap();
+        values
+            .into_iter()
+            .map(|value| {
+                dynamic.update(value).unwrap();
+                compacted.current().1.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// TopK's later `price < 0.0` compacts to `true` on its own; the latch keeps `price <= 1`.
+    #[test]
+    fn latch_keeps_float_bound_when_tighter_bound_reaches_zero() {
+        let published = published_after(
+            vec![
+                binary(col("price"), Operator::Lt, lit(1.0f64)),
+                binary(col("price"), Operator::Lt, lit(0.0f64)),
+            ],
+            150,
+        );
+        assert_snapshot!(published, @"
+        price@2 <= 1
+        price@2 <= 1
+        ");
+    }
+
+    /// A value set that crosses the cap becomes a range on its own; the latch keeps the set.
+    #[test]
+    fn latch_keeps_value_set_when_a_union_crosses_the_cap() {
+        let published = published_after(
+            vec![
+                in_list("id", &[1, 5, 9]),
+                // The same rows, but the union of its branches' sets crosses the cap.
+                binary(
+                    binary(
+                        in_list("id", &[1, 5]),
+                        Operator::Or,
+                        in_list("id", &[9, 20]),
+                    ),
+                    Operator::And,
+                    bounds("id", 1, 9),
+                ),
+            ],
+            3,
+        );
+        assert_snapshot!(published, @"
+        id@0 >= 1 AND id@0 <= 9 AND id@0 IN (SET) ([1, 5, 9])
+        id@0 >= 1 AND id@0 <= 9 AND id@0 IN (SET) ([1, 5, 9])
+        ");
+    }
+
+    /// A column constrained earlier but no longer constrained keeps its earlier constraint.
+    #[test]
+    fn latch_keeps_constraints_on_columns_a_later_value_drops() {
+        let published = published_after(
+            vec![
+                binary(
+                    bounds("id", 1, 9),
+                    Operator::And,
+                    binary(col("price"), Operator::Lt, lit(5.0f64)),
+                ),
+                bounds("id", 2, 4),
+            ],
+            150,
+        );
+        assert_snapshot!(published, @"
+        id@0 >= 1 AND id@0 <= 9 AND price@2 <= 5
+        id@0 >= 2 AND id@0 <= 4 AND price@2 <= 5
+        ");
+    }
+
+    /// Once nothing can pass, nothing passes for every later value.
+    #[test]
+    fn latch_stays_false_once_a_value_compacts_to_false() {
+        let published = published_after(vec![lit(false), bounds("id", 1, 9), lit(true)], 150);
+        assert_snapshot!(published, @"
+        false
+        false
+        false
+        ");
     }
 
     fn show(expr: &Arc<dyn PhysicalExpr>, max_values: usize) -> String {
