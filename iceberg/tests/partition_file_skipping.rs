@@ -243,10 +243,11 @@ mod tests {
     }
 
     /// A recursive query re-executes its recursive term once per iteration after
-    /// `reset_plan_states`, which drops the hash join's dynamic filter. Here the Iceberg scan
-    /// is the join's probe side in every iteration, and each iteration needs a different day.
-    /// No iteration may skip a file an earlier one's filter ruled out: the rows match the
-    /// setting off. Lazy scans can't be re-executed, so the files are planned eagerly.
+    /// `reset_plan_states`, which in DataFusion 55 drops the hash join's dynamic filter before
+    /// the first iteration too, so the probe scan's filter never receives a value. Here the
+    /// Iceberg scan is the join's probe side in every iteration, and each iteration needs a
+    /// different day: the rows match the setting off. Lazy scans can't be re-executed, so the
+    /// files are planned eagerly.
     #[tokio::test]
     async fn recursive_query_reexecuting_the_probe_scan_returns_same_rows() -> Result<()> {
         let (_, off_rows) = IcebergTestHarness::builder()

@@ -61,14 +61,19 @@
 //! reading one value while the filters change see it only tighten.
 //!
 //! The latch is monotone within one execution of a plan over a fixed snapshot, where the
-//! filters only tighten. It is bound to the filter objects themselves: a scan builds a new
-//! instance whenever the set of kept filter `Arc`s changes, and an instance starts over if
-//! the filters' generation goes backwards. Re-executing a plan is still safe:
-//! * Executing the same plan again reuses the hash join's build side and its filter's final
-//!   value, and TopK starts from the same data, so the filters reach the same values.
-//! * `reset_plan_states`, which recursive queries run before every iteration of their
-//!   recursive term, including the first, drops the hash join's filter handle, so the scan's
-//!   filter is never updated and stays `true`: the latch has nothing to latch onto.
+//! filters only tighten. It holds no per-execution state: a scan builds a new instance when
+//! the set of kept filter `Arc`s changes, but a re-executed `DataSourceExec` keeps its scan
+//! config, this instance and the same filter `Arc`s. Re-execution is covered only where the
+//! filters can't reach a looser value:
+//! * The same plan run again with a fixed build side: the hash join reuses its build side, so
+//!   its filter reaches the same value.
+//! * Recursive queries in DataFusion 55: `reset_plan_states` runs before every iteration of
+//!   the recursive term, including the first, and drops the hash join's filter handle, so
+//!   the scan's filter never receives a value and stays `true`.
+//!
+//! Re-executing a plan with dynamic filters after a completed run and `reset_plan_states` is
+//! unsupported, as DataFusion documents on `reset_plan_states`: the scan keeps the previous
+//! run's filter and its value, which would affect any scan reading it, latched or not.
 //!
 //! Literals are used only when their type is exactly the column's, and float NaN and zero
 //! literals constrain nothing, so float comparisons never depend on how NaN or the sign of
@@ -163,8 +168,9 @@ impl CompactedDynamicFilters {
             // Fail open: no constraint.
             Err(_) => Domain::all(),
         };
-        // Latch only onto an older generation of these same filters. A generation that went
-        // backwards can't come from one tightening sequence, so start over from this value.
+        // Defensive: generations only increase, so a cached value tagged with a newer one is
+        // not from this tightening sequence; don't intersect with it. This is not an
+        // execution reset: re-executions keep increasing the generation.
         let domain = match cached.take() {
             Some(previous) if previous.generation < generation => previous.domain.intersect(domain),
             _ => domain,
@@ -997,10 +1003,10 @@ mod tests {
         );
     }
 
-    /// A cached value from a newer generation than the filters' current one can't be part of
-    /// the same tightening sequence, so it is not intersected with the current value.
+    /// Defensive handling of a non-increasing generation: a cached value tagged with a newer
+    /// generation than the filters' current one is not intersected with the current value.
     #[test]
-    fn latch_starts_over_when_the_generation_goes_backwards() {
+    fn latch_ignores_a_cached_value_from_a_newer_generation() {
         let schema = Arc::new(schema());
         let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![col("id")], lit(true)));
         let compacted =
