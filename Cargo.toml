@@ -132,6 +132,6 @@ disallowed-methods = "deny"
 # Rebuild the branch whenever that pin moves:
 # https://github.com/Perseus/iceberg-rust/tree/dfd/runtime-predicate-5b82ab9
 [patch."https://github.com/apache/iceberg-rust"]
-iceberg = { git = "https://github.com/Perseus/iceberg-rust", rev = "c9f5567d071431edb7027d01029bdfef81feb4e2" }
-iceberg-property-macro = { git = "https://github.com/Perseus/iceberg-rust", rev = "c9f5567d071431edb7027d01029bdfef81feb4e2" }
-iceberg-storage-opendal = { git = "https://github.com/Perseus/iceberg-rust", rev = "c9f5567d071431edb7027d01029bdfef81feb4e2" }
+iceberg = { git = "https://github.com/Perseus/iceberg-rust", rev = "a918471fa1fa041f77cca8427140d7a7b373dcdd" }
+iceberg-property-macro = { git = "https://github.com/Perseus/iceberg-rust", rev = "a918471fa1fa041f77cca8427140d7a7b373dcdd" }
+iceberg-storage-opendal = { git = "https://github.com/Perseus/iceberg-rust", rev = "a918471fa1fa041f77cca8427140d7a7b373dcdd" }
