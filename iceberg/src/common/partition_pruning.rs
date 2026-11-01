@@ -633,10 +633,10 @@ mod tests {
     /// on a value between them keeps the file and one past them skips it.
     #[test]
     fn truncated_string_bounds_still_bound_the_values() {
-        // Values from "abcdef-long" to "abcxyz-long", truncated to 3 characters.
+        // Values from "carbon-long" to "carton-long", truncated to 3 characters.
         let stats = FileScanTaskColumnStats::builder()
-            .with_lower_bounds(HashMap::from([(3, Datum::string("abc"))]))
-            .with_upper_bounds(HashMap::from([(3, Datum::string("abd"))]))
+            .with_lower_bounds(HashMap::from([(3, Datum::string("car"))]))
+            .with_upper_bounds(HashMap::from([(3, Datum::string("cas"))]))
             .build();
         let task = task_with_stats(stats);
         let name: Arc<dyn PhysicalExpr> = Arc::new(Column::new("name", 2));
@@ -650,12 +650,12 @@ mod tests {
         };
 
         insta::assert_snapshot!(
-            ["abcdef-long", "abcxyz-long", "abd-long", "abb"].map(skips).join("\n"),
+            ["carbon-long", "carton-long", "cast-long", "cap"].map(skips).join("\n"),
             @"
-        name = abcdef-long: skip=false
-        name = abcxyz-long: skip=false
-        name = abd-long: skip=true
-        name = abb: skip=true
+        name = carbon-long: skip=false
+        name = carton-long: skip=false
+        name = cast-long: skip=true
+        name = cap: skip=true
         "
         );
     }

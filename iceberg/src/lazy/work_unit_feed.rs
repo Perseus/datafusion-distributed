@@ -343,12 +343,12 @@ mod tests {
             .with_nan_value_counts(HashMap::from([(3, 0)]))
             .with_lower_bounds(HashMap::from([
                 (1, Datum::date(19730)),
-                (2, Datum::string("abc")),
+                (2, Datum::string("car")),
                 (3, Datum::double(-0.0)),
             ]))
             .with_upper_bounds(HashMap::from([
                 (1, Datum::date(19736)),
-                (2, Datum::string("abd")),
+                (2, Datum::string("cas")),
                 (3, Datum::double(2.5)),
             ]))
             .build();
