@@ -40,19 +40,22 @@
 //!
 //! # Tighten-only invariant
 //!
-//! A consumer may skip data (a file, a row group) based on a compacted value only if later
-//! values of the filter never loosen it: data skipped under one generation must stay
-//! skippable. That holds for the dynamic filters reaching a scan today:
+//! A consumer may skip data (a file, a row group) only if data skipped under one generation
+//! stays skippable under every later one. The filters themselves only tighten for the dynamic
+//! filters reaching a scan today:
 //! * DataFusion's producers: the hash join updates its filter once, after its build barrier;
-//!   TopK and aggregate filters are monotone and only tighten.
+//!   TopK and aggregate filters only tighten.
 //! * The distributed merge modes in `src/coordinator/dynamic_filter_registry.rs`:
 //!   `UnionWhenAllComplete` and `ForwardFirstComplete` forward one value, and
 //!   `IntersectOnUpdate` only tightens.
 //!
-//! Compaction is a widening function and is monotone only under these conditions. For
-//! example, a union of value sets that crosses the cap between two updates could turn a set
-//! into a range and lose precision, so a new producer must not rely on compaction preserving
-//! an ordering its updates don't already have.
+//! A tightening filter does not imply a tightening compacted value. Compaction widens, and
+//! can widen a later, tighter value more than an earlier one: a float bound that moves to NaN
+//! or zero constrains nothing (TopK's `price < 1.0` compacts to `price <= 1.0`, its later
+//! `price < 0.0` to `true`), and a union of value sets that crosses the cap becomes a range.
+//! A consumer that skips data must therefore guard against a looser compacted value itself,
+//! for example by keeping what it already skipped skipped, or by intersecting each new value
+//! with the previous one, which is sound because the filters only tighten.
 //!
 //! Literals are used only when their type is exactly the column's, and float NaN and zero
 //! literals constrain nothing, so float comparisons never depend on how NaN or the sign of
@@ -811,6 +814,16 @@ mod tests {
             ),
         );
         assert_snapshot!(show(&filter, 150), @"price@2 <= 9.5");
+    }
+
+    /// TopK replaces `price < 1.0` with the tighter `price < 0.0`, but a zero bound constrains
+    /// nothing, so the compacted value loosens. Consumers must guard against this.
+    #[test]
+    fn tighter_float_bound_at_zero_compacts_looser() {
+        let earlier = binary(col("price"), Operator::Lt, lit(1.0f64));
+        let later = binary(col("price"), Operator::Lt, lit(0.0f64));
+        assert_snapshot!(show(&earlier, 150), @"price@2 <= 1");
+        assert_snapshot!(show(&later, 150), @"true");
     }
 
     /// The hash join's filter goes from `true` to its final value, and then an intersecting
