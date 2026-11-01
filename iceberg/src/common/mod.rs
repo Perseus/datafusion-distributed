@@ -6,3 +6,6 @@ mod file_partition;
 pub(crate) mod kept_filters;
 pub(crate) mod scan_config;
 pub(crate) use file_partition::file_partition;
+// Wired into scan pruning in a follow-up change.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod dynamic_domain;
