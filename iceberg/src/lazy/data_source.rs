@@ -19,6 +19,7 @@ use iceberg::spec::SnapshotRef;
 
 use crate::IcebergWorkUnitFeed;
 use crate::common::iceberg_err;
+use crate::common::kept_filters::{apply_filters, fmt_filters, keeps_filters};
 
 /// Consumes a stream of [iceberg::scan::FileScanTask]s per partition and reads the underlying
 /// files into an Arrow stream.
@@ -113,6 +114,12 @@ pub struct LazyIcebergDataSource {
     pub(crate) column_stats: Option<Vec<ColumnStatistics>>,
     pub(crate) table_snapshot: Option<SnapshotRef>,
     pub(crate) feed: WorkUnitFeed<IcebergWorkUnitFeed>,
+    /// Filters pushed down by parent operators (including dynamic filters), expressed against
+    /// this source's output schema. Kept only when `iceberg.dynamic_filter_pruning_enabled` is
+    /// set, and never applied by this source: every one is reported as [PushedDown::No]. Static
+    /// filters are enforced by the `FilterExec` above the scan; dynamic filters have no
+    /// `FilterExec` and are enforced by the operator that created them, such as a hash join.
+    pub(crate) filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl LazyIcebergDataSource {
@@ -126,9 +133,9 @@ impl LazyIcebergDataSource {
 impl DataSource for LazyIcebergDataSource {
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
+        apply_filters(&self.filters, f)
     }
 
     fn open(
@@ -149,20 +156,20 @@ impl DataSource for LazyIcebergDataSource {
 
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "format=iceberg")?;
-        let Some(feed) = self.feed.inner() else {
-            return Ok(());
-        };
-        write!(f, ", table={}", feed.iceberg_table.identifier())?;
-        if let Some(projection) = &feed.projection {
-            write!(f, ", projection=[{}]", projection.join(", "))?;
-        }
-        if let Some(predicate) = &feed.predicates {
-            write!(f, ", predicate={predicate}")?;
+        // Workers decode the source without its feed's table details.
+        if let Some(feed) = self.feed.inner() {
+            write!(f, ", table={}", feed.iceberg_table.identifier())?;
+            if let Some(projection) = &feed.projection {
+                write!(f, ", projection=[{}]", projection.join(", "))?;
+            }
+            if let Some(predicate) = &feed.predicates {
+                write!(f, ", predicate={predicate}")?;
+            }
         }
         if let Some(fetch) = self.scan.fetch {
             write!(f, ", fetch={fetch}")?;
         }
-        Ok(())
+        fmt_filters(&self.filters, "physical_predicate", f)
     }
 
     fn output_partitioning(&self) -> Partitioning {
@@ -210,14 +217,20 @@ impl DataSource for LazyIcebergDataSource {
     fn try_pushdown_filters(
         &self,
         filters: Vec<Arc<dyn PhysicalExpr>>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
-        // TODO: Allow this DataSource to be pushed down filters. Some filters might be more
-        //  straight forward to accept, like simple predicates, but some others might require
-        //  a bit more work, like dynamic filters.
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-            vec![PushedDown::No; filters.len()],
-        ))
+        let pushed_down = vec![PushedDown::No; filters.len()];
+        if !keeps_filters(config) {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                pushed_down,
+            ));
+        }
+        let mut source = self.clone();
+        source.filters.extend(filters);
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(pushed_down)
+                .with_updated_node(Arc::new(source) as _),
+        )
     }
 
     fn try_pushdown_sort(

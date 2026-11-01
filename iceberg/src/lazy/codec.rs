@@ -98,6 +98,11 @@ impl PhysicalExtensionCodec for LazyIcebergCodec {
             .map(usize::try_from)
             .transpose()
             .map_err(|_| proto_error("Iceberg fetch limit does not fit in usize"))?;
+        let filters = proto
+            .filters
+            .iter()
+            .map(|filter| proto_converter.proto_to_physical_expr(filter, &schema, &decode_ctx))
+            .collect::<Result<Vec<_>>>()?;
         let iceberg_file_io = self.file_io_codec.decode(
             proto.storage_properties,
             proto.custom_file_io.as_deref(),
@@ -116,6 +121,7 @@ impl PhysicalExtensionCodec for LazyIcebergCodec {
             column_stats: None,
             table_snapshot: None,
             feed,
+            filters,
         }))
     }
 
@@ -150,6 +156,11 @@ impl PhysicalExtensionCodec for LazyIcebergCodec {
             fetch: source.scan.fetch.map(|value| value as u64),
             storage_properties: file_io.properties,
             custom_file_io: file_io.custom,
+            filters: source
+                .filters
+                .iter()
+                .map(|filter| proto_converter.physical_expr_to_proto(filter, self))
+                .collect::<Result<Vec<_>>>()?,
         };
         proto.encode(buf).map_err(|error| {
             proto_error(format!("failed to encode LazyIcebergDataSource: {error}"))
@@ -165,6 +176,8 @@ mod tests {
     use datafusion_proto::physical_plan::DefaultPhysicalProtoConverter;
     use iceberg::io::{FileIOBuilder, LocalFsStorageFactory};
     use iceberg::table::Table;
+
+    use datafusion::physical_expr::expressions::lit;
 
     use super::*;
     use crate::common::df_err;
@@ -231,6 +244,43 @@ mod tests {
             decoded.partition_statistics(None)?.as_ref(),
             &Statistics::new_unknown(&decoded.scan.schema)
         );
+        Ok(())
+    }
+
+    /// Payloads written before kept filters existed omit the field, and decode to a scan
+    /// without filters, as do scans planned with the setting off.
+    #[tokio::test]
+    async fn decodes_kept_filters_and_payloads_without_them() -> Result<()> {
+        let taxi = create_taxi_table().await?;
+        let plan = plan_scan(
+            taxi.table().clone(),
+            taxi.schema()?,
+            Default::default(),
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        let mut source = iceberg_source(&plan)?.clone();
+        source.filters = vec![lit(true)];
+        let codec = LazyIcebergCodec::default();
+        let proto_converter = DefaultPhysicalProtoConverter {};
+        let mut buf = Vec::new();
+        codec.try_encode(
+            DataSourceExec::from_data_source(source),
+            &mut buf,
+            &proto_converter,
+        )?;
+        let decoded = codec.try_decode(&buf, &[], &TaskContext::default(), &proto_converter)?;
+        assert_eq!(iceberg_source(&decoded)?.filters.len(), 1);
+
+        let mut old = pb::IcebergDataSource::decode(buf.as_slice()).unwrap();
+        old.filters.clear();
+        let decoded = codec.try_decode(
+            &old.encode_to_vec(),
+            &[],
+            &TaskContext::default(),
+            &proto_converter,
+        )?;
+        assert!(iceberg_source(&decoded)?.filters.is_empty());
         Ok(())
     }
 

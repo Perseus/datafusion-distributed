@@ -1,14 +1,17 @@
+use crate::common::kept_filters::{apply_filters, fmt_filters, keeps_filters};
 use crate::common::scan_config::ScanConfig;
 use crate::eager::planned_files::PlannedFiles;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Statistics, exec_err};
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::DisplayFormatType;
+use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::StreamExt;
 use iceberg::io::FileIO;
@@ -24,6 +27,12 @@ pub struct EagerIcebergDataSource {
     pub(crate) statistics: Arc<Statistics>,
     pub(crate) files: Arc<PlannedFiles>,
     pub(crate) partitions: Arc<[Vec<usize>]>,
+    /// Filters pushed down by parent operators (including dynamic filters), expressed against
+    /// this source's output schema. Kept only when `iceberg.dynamic_filter_pruning_enabled` is
+    /// set, and never applied by this source: every one is reported as [PushedDown::No]. Static
+    /// filters are enforced by the `FilterExec` above the scan; dynamic filters have no
+    /// `FilterExec` and are enforced by the operator that created them, such as a hash join.
+    pub(crate) filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 impl EagerIcebergDataSource {
     /// Construct a scan from already selected files grouped by local output partition.
@@ -64,6 +73,7 @@ impl EagerIcebergDataSource {
             ),
             files: Arc::new(PlannedFiles::from_tasks(tasks, context)?),
             partitions: partitions.into(),
+            filters: Vec::new(),
         })
     }
 
@@ -144,9 +154,9 @@ impl EagerIcebergDataSource {
 impl DataSource for EagerIcebergDataSource {
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
+        apply_filters(&self.filters, f)
     }
     fn open(
         &self,
@@ -171,7 +181,7 @@ impl DataSource for EagerIcebergDataSource {
         if let Some(fetch) = self.scan.fetch {
             write!(f, ", fetch={fetch}")?;
         }
-        Ok(())
+        fmt_filters(&self.filters, "predicate", f)
     }
     fn output_partitioning(&self) -> Partitioning {
         self.scan.partitioning.clone()
@@ -199,5 +209,24 @@ impl DataSource for EagerIcebergDataSource {
     }
     fn metrics(&self) -> ExecutionPlanMetricsSet {
         self.scan.metrics.clone()
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
+        let pushed_down = vec![PushedDown::No; filters.len()];
+        if !keeps_filters(config) {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                pushed_down,
+            ));
+        }
+        let mut source = self.clone();
+        source.filters.extend(filters);
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(pushed_down)
+                .with_updated_node(Arc::new(source) as _),
+        )
     }
 }

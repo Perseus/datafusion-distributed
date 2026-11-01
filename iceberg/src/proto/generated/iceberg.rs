@@ -15,6 +15,10 @@ pub struct IcebergDataSource {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(bytes = "vec", optional, tag = "6")]
     pub custom_file_io: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Filters pushed down by parent operators, including dynamic filters. Empty unless
+    /// `iceberg.dynamic_filter_pruning_enabled` was set when the scan was planned.
+    #[prost(message, repeated, tag = "7")]
+    pub filters: ::prost::alloc::vec::Vec<::datafusion_proto::protobuf::PhysicalExprNode>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -36,6 +40,10 @@ pub struct ScanConfig {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(bytes = "vec", optional, tag = "5")]
     pub custom_file_io: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Filters pushed down by parent operators, including dynamic filters. Empty unless
+    /// `iceberg.dynamic_filter_pruning_enabled` was set when the scan was planned.
+    #[prost(message, repeated, tag = "6")]
+    pub filters: ::prost::alloc::vec::Vec<::datafusion_proto::protobuf::PhysicalExprNode>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]

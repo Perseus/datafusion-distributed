@@ -18,6 +18,13 @@ extensions_options! {
         pub column_stats_enabled: bool, default = false
         /// Discover and retain file tasks during physical planning instead of execution.
         pub eager_file_planning: bool, default = false
+        /// Whether Iceberg scans keep the filters parent operators push into them, including
+        /// dynamic filters such as a hash join's build-side bounds, and send them to workers
+        /// with the scan. Kept filters are shown in EXPLAIN but do not yet change what the
+        /// scan reads: every filter is still reported as not pushed down. Static filters stay
+        /// enforced by the `FilterExec` above the scan; dynamic filters have no `FilterExec`
+        /// and are enforced by the operator that created them (for example the hash join).
+        pub dynamic_filter_pruning_enabled: bool, default = false
     }
 }
 
