@@ -19,7 +19,7 @@ pub(crate) fn apply_filters(
     Ok(TreeNodeRecursion::Continue)
 }
 
-/// Writes `, <key>=<filters ANDed together>`, or nothing when there are no filters.
+/// Writes `, <key>=<filters joined with AND>`, or nothing when there are no filters.
 pub(crate) fn fmt_filters(
     filters: &[Arc<dyn PhysicalExpr>],
     key: &str,
