@@ -60,6 +60,16 @@
 //! later values keep a subset of those rows; the latch exists so that consumers which keep
 //! reading one value while the filters change see it only tighten.
 //!
+//! The latch is monotone within one execution of a plan over a fixed snapshot, where the
+//! filters only tighten. It is bound to the filter objects themselves: a scan builds a new
+//! instance whenever the set of kept filter `Arc`s changes, and an instance starts over if
+//! the filters' generation goes backwards. Re-executing a plan is still safe:
+//! * Executing the same plan again reuses the hash join's build side and its filter's final
+//!   value, and TopK starts from the same data, so the filters reach the same values.
+//! * `reset_plan_states`, which recursive queries run before every iteration of their
+//!   recursive term, including the first, drops the hash join's filter handle, so the scan's
+//!   filter is never updated and stays `true`: the latch has nothing to latch onto.
+//!
 //! Literals are used only when their type is exactly the column's, and float NaN and zero
 //! literals constrain nothing, so float comparisons never depend on how NaN or the sign of
 //! zero is ordered.
@@ -153,9 +163,11 @@ impl CompactedDynamicFilters {
             // Fail open: no constraint.
             Err(_) => Domain::all(),
         };
+        // Latch only onto an older generation of these same filters. A generation that went
+        // backwards can't come from one tightening sequence, so start over from this value.
         let domain = match cached.take() {
-            Some(previous) => previous.domain.intersect(domain),
-            None => domain,
+            Some(previous) if previous.generation < generation => previous.domain.intersect(domain),
+            _ => domain,
         };
         let expr = domain.clone().into_expr(&self.schema);
         *cached = Some(Published {
@@ -983,6 +995,23 @@ mod tests {
                 .generation,
             compacted.generation()
         );
+    }
+
+    /// A cached value from a newer generation than the filters' current one can't be part of
+    /// the same tightening sequence, so it is not intersected with the current value.
+    #[test]
+    fn latch_starts_over_when_the_generation_goes_backwards() {
+        let schema = Arc::new(schema());
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![col("id")], lit(true)));
+        let compacted =
+            CompactedDynamicFilters::try_new(&[Arc::clone(&dynamic) as _], &schema, 150).unwrap();
+        dynamic.update(bounds("id", 1, 9)).unwrap();
+        *compacted.cached.lock().unwrap() = Some(Published {
+            generation: compacted.generation() + 1,
+            domain: Domain::None,
+            expr: lit(false),
+        });
+        assert_snapshot!(compacted.current().1, @"id@0 >= 1 AND id@0 <= 9");
     }
 
     /// Feeds `values` to one dynamic filter in turn and returns what consumers see after each.

@@ -209,6 +209,76 @@ mod tests {
         Ok(())
     }
 
+    /// Executing the same plan again reuses the hash join's build side, so its dynamic filter
+    /// reaches the same value and the shared, latched value skips the same six files again
+    /// (the metric adds up across both executions). The rows are the same both times.
+    #[tokio::test]
+    async fn same_plan_executed_twice_skips_the_same_files() -> Result<()> {
+        let harness = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .build()
+            .await?;
+
+        let plan = harness.physical_plan(SEMI_JOIN_QUERY).await?;
+        let first = collect(Arc::clone(&plan), harness.state().task_ctx()).await?;
+        let second = collect(Arc::clone(&plan), harness.state().task_ctx()).await?;
+
+        insta::assert_snapshot!(scan_metrics(&plan), @"
+        files_skipped=- output_rows=25000
+        files_skipped=12 output_rows=50000
+        ");
+        let rows = pretty_format_batches(&second)?.to_string();
+        assert_eq!(pretty_format_batches(&first)?.to_string(), rows);
+        insta::assert_snapshot!(rows, @"
+        +-------+
+        | trips |
+        +-------+
+        | 25000 |
+        +-------+
+        ");
+        Ok(())
+    }
+
+    /// A recursive query re-executes its recursive term once per iteration after
+    /// `reset_plan_states`, which drops the hash join's dynamic filter. Here the Iceberg scan
+    /// is the join's probe side in every iteration, and each iteration needs a different day.
+    /// No iteration may skip a file an earlier one's filter ruled out: the rows match the
+    /// setting off. Lazy scans can't be re-executed, so the files are planned eagerly.
+    #[tokio::test]
+    async fn recursive_query_reexecuting_the_probe_scan_returns_same_rows() -> Result<()> {
+        let (_, off_rows) = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", false)
+            .query(RECURSIVE_QUERY)
+            .await?;
+        let (_, on_rows) = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(create_taxi_table().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.dynamic_filter_pruning_enabled", true)
+            .query(RECURSIVE_QUERY)
+            .await?;
+
+        assert_eq!(off_rows, on_rows);
+        insta::assert_snapshot!(on_rows, @"
+        +------------+
+        | d          |
+        +------------+
+        | 2024-01-08 |
+        | 2024-01-09 |
+        | 2024-01-10 |
+        | 2024-01-11 |
+        | 2024-01-12 |
+        +------------+
+        ");
+        Ok(())
+    }
+
     /// Distributed, worker probe scans may start before the coordinator forwards the dynamic
     /// filter's value, so how many files they skip varies: only the rows are checked.
     #[tokio::test]
@@ -242,6 +312,18 @@ mod tests {
             SELECT pickup_date FROM taxi
             WHERE pickup_date IN (DATE '2024-01-08', DATE '2024-01-14')
         )";
+
+    /// Walks one day at a time from 2024-01-08, probing the taxi table for the next day. The
+    /// `+ INTERVAL '0 days'` drops the Iceberg field id, which the recursive term's output
+    /// must not carry.
+    const RECURSIVE_QUERY: &str = r"WITH RECURSIVE days(d) AS (
+            SELECT DATE '2024-01-08'
+            UNION ALL
+            SELECT DISTINCT t.pickup_date + INTERVAL '0 days'
+            FROM days JOIN taxi t ON t.pickup_date = days.d + INTERVAL '1 day'
+            WHERE days.d < DATE '2024-01-12'
+        )
+        SELECT d FROM days ORDER BY d";
 
     /// Pickup times are distinct within a day, so the order is total.
     const TOPK_QUERY: &str = r"SELECT pickup_date, pickup_at
