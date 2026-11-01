@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: iceberg-pruning-bench-${{ github.ref }}
@@ -25,9 +26,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  config:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
     outputs:
       sf: ${{ steps.p.outputs.sf }}
       fr: ${{ steps.p.outputs.fr }}
@@ -36,10 +36,9 @@ jobs:
       si: ${{ steps.p.outputs.si }}
       rs: ${{ steps.p.outputs.rs }}
       replicas: ${{ steps.p.outputs.replicas }}
+      bins_run_id: ${{ steps.p.outputs.bins_run_id }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - id: p
         name: Select profile
         run: |
@@ -51,47 +50,75 @@ jobs:
           else
             echo "sf=10 fr=5 fi=10 sr=3 si=5 rs=1 replicas=[1,2,3]" | tr ' ' '\n' >> "$GITHUB_OUTPUT"
           fi
+          # Non-empty: reuse the `bins` artifact of that run instead of compiling.
+          RID=$(tr -d '[:space:]' < .github/bench/bins-run-id 2>/dev/null || true)
+          echo "bins_run_id=$RID" | tee -a "$GITHUB_OUTPUT"
+
+  build-head:
+    needs: config
+    if: needs.config.outputs.bins_run_id == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Prepare base source (fork main + env patch only)
-        run: |
-          git worktree add base-src "$BASE_SHA"
-          git -C base-src apply "$PWD/.github/bench/env-patch.diff"
-          git -C base-src diff --stat
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v1-bench
-          workspaces: |
-            . -> target
-            base-src -> target
+          prefix-key: v1-bench-head
       - name: Build head
-        run: |
-          cargo build --release -p datafusion-distributed-iceberg-benchmarks -p datafusion-distributed-benchmarks
-      - name: Build base
-        working-directory: base-src
-        run: cargo build --release -p datafusion-distributed-iceberg-benchmarks
+        run: cargo build --release -p datafusion-distributed-iceberg-benchmarks -p datafusion-distributed-benchmarks
       - name: Stage binaries
         run: |
           mkdir -p bins
           cp target/release/dfbench bins/dfbench
           cp target/release/dfbench-iceberg bins/dfbench-iceberg-head
-          cp base-src/target/release/dfbench-iceberg bins/dfbench-iceberg-base
-          ls -la bins
       - uses: actions/upload-artifact@v4
         with:
-          name: bins
+          name: bins-head
           path: bins
-          retention-days: 3
+          retention-days: 14
+
+  build-base:
+    needs: config
+    if: needs.config.outputs.bins_run_id == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: bins/dfbench-iceberg-base
+          key: dfbench-iceberg-base-${{ env.BASE_SHA }}-${{ hashFiles('.github/bench/env-patch.diff') }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/setup
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Build base (fork main + env patch only)
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          git worktree add base-src "$BASE_SHA"
+          git -C base-src apply "$PWD/.github/bench/env-patch.diff"
+          (cd base-src && cargo build --release -p datafusion-distributed-iceberg-benchmarks)
+          mkdir -p bins && cp base-src/target/release/dfbench-iceberg bins/dfbench-iceberg-base
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins-base
+          path: bins
+          retention-days: 14
 
   bench:
-    needs: build
+    needs: [config, build-head, build-base]
+    if: always() && needs.config.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
-        replica: ${{ fromJSON(needs.build.outputs.replicas) }}
+        replica: ${{ fromJSON(needs.config.outputs.replicas) }}
     steps:
       - uses: actions/checkout@v4
       - name: Free disk
@@ -109,14 +136,28 @@ jobs:
           sudo apt-get install -y "linux-tools-$(uname -r)" linux-tools-common || sudo apt-get install -y linux-tools-generic || true
           sudo sysctl -w kernel.perf_event_paranoid=-1 || true
           perf stat -e task-clock,instructions,cycles true || true
-      - uses: actions/download-artifact@v4
+      - name: Download reused binaries
+        if: needs.config.outputs.bins_run_id != ''
+        uses: actions/download-artifact@v4
         with:
           name: bins
           path: bins
-      - name: Prepare TPC-H SF${{ needs.build.outputs.sf }} as Iceberg
+          run-id: ${{ needs.config.outputs.bins_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download fresh binaries
+        if: needs.config.outputs.bins_run_id == ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bins-*
+          path: bins
+          merge-multiple: true
+      - name: Prepare TPC-H SF${{ needs.config.outputs.sf }} as Iceberg
         run: |
           chmod +x bins/*
-          DATASET=$(bins/dfbench prepare-tpch --scale-factor ${{ needs.build.outputs.sf }})
+          ls -la bins
+          # The base binary resolves its query files via its compile-time path (base-src/...).
+          ln -sfn "$PWD" base-src
+          DATASET=$(bins/dfbench prepare-tpch --scale-factor ${{ needs.config.outputs.sf }})
           ICEBERG=$(bins/dfbench-iceberg-head prepare --input "$DATASET")
           echo "ICEBERG=$ICEBERG" >> "$GITHUB_ENV"
           echo "$DATASET -> $ICEBERG" | tee out/dataset.txt
@@ -125,12 +166,12 @@ jobs:
       - name: Run interleaved benchmark
         run: |
           bash .github/bench/run.sh "$PWD/bins/dfbench-iceberg-base" "$PWD/bins/dfbench-iceberg-head" "$ICEBERG" out \
-            ${{ needs.build.outputs.fr }} ${{ needs.build.outputs.fi }} ${{ needs.build.outputs.sr }} ${{ needs.build.outputs.si }} ${{ needs.build.outputs.rs }}
+            ${{ needs.config.outputs.fr }} ${{ needs.config.outputs.fi }} ${{ needs.config.outputs.sr }} ${{ needs.config.outputs.si }} ${{ needs.config.outputs.rs }}
       - name: Summary
         if: always()
         run: |
           {
-            echo "## Replica ${{ matrix.replica }} — TPC-H SF${{ needs.build.outputs.sf }}"
+            echo "## Replica ${{ matrix.replica }} — TPC-H SF${{ needs.config.outputs.sf }}"
             echo '```'; grep -E 'Model name|^CPU\(s\)' out/runner-specs.txt; grep Mem: out/runner-specs.txt; cat out/perf-mode.txt 2>/dev/null; echo '```'
             python3 .github/bench/analyze.py out
           } | tee out/summary.md >> "$GITHUB_STEP_SUMMARY"
@@ -142,8 +183,8 @@ jobs:
           retention-days: 14
 
   combine:
-    needs: [build, bench]
-    if: always() && needs.build.result == 'success'
+    needs: [config, bench]
+    if: always() && needs.config.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -153,7 +194,7 @@ jobs:
           path: all
       - name: Combined summary
         run: |
-          { echo "## All replicas combined — TPC-H SF${{ needs.build.outputs.sf }}"; python3 .github/bench/analyze.py all; } | tee combined.md >> "$GITHUB_STEP_SUMMARY"
+          { echo "## All replicas combined — TPC-H SF${{ needs.config.outputs.sf }}"; python3 .github/bench/analyze.py all; } | tee combined.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: combined-summary
