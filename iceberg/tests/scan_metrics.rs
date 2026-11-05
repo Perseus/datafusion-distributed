@@ -28,7 +28,7 @@ mod tests {
         insta::with_settings!({
             filters => [(r"elapsed_compute=\{[^}]*\}, ", "")],
         }, {
-            insta::assert_snapshot!(scan_lines(&plan), @"DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], predicate=pickup_date <= 2024-01-10, metrics=[output_rows={0:50.00 K, 1:25.00 K}, output_bytes={0:256.0 KB, 1:128.0 KB}, output_batches={0:8, 1:4}, batches_split={0:0, 1:0}, bytes_scanned={0:1.05 M, 1:524.4 K}, files_opened={0:2, 1:1}]");
+            insta::assert_snapshot!(scan_lines(&plan), @"DataSourceExec: format=iceberg, table=default.taxi, projection=[pickup_date], predicate=pickup_date <= 2024-01-10, filters=pickup_date@0 <= 2024-01-10, metrics=[output_rows={0:50.00 K, 1:25.00 K}, output_bytes={0:256.0 KB, 1:128.0 KB}, output_batches={0:8, 1:4}, batches_split={0:0, 1:0}, bytes_scanned={0:1.05 M, 1:524.4 K}, files_opened={0:2, 1:1}]");
         });
         Ok(())
     }
@@ -57,9 +57,9 @@ mod tests {
         insta::with_settings!({
             filters => [(r"elapsed_compute=\{[^}]*\}, ", "")],
         }, {
-            insta::assert_snapshot!(scan_lines(&plan), @r"
-            t0: DataSourceExec: format=iceberg, planned_files=1, metrics=[output_rows={0:25.00 K}, output_bytes={0:128.0 KB}, output_batches={0:4}, batches_split={0:0}, bytes_scanned={0:524.4 K}, files_opened={0:1}]
-            t1: DataSourceExec: format=iceberg, planned_files=2, metrics=[output_rows={1:50.00 K}, output_bytes={1:256.0 KB}, output_batches={1:8}, batches_split={1:0}, bytes_scanned={1:1.05 M}, files_opened={1:2}]
+            insta::assert_snapshot!(scan_lines(&plan), @"
+            t0: DataSourceExec: format=iceberg, planned_files=1, filters=pickup_date@0 <= 2024-01-10, metrics=[output_rows={0:25.00 K}, output_bytes={0:128.0 KB}, output_batches={0:4}, batches_split={0:0}, bytes_scanned={0:524.4 K}, files_opened={0:1}]
+            t1: DataSourceExec: format=iceberg, planned_files=2, filters=pickup_date@0 <= 2024-01-10, metrics=[output_rows={1:50.00 K}, output_bytes={1:256.0 KB}, output_batches={1:8}, batches_split={1:0}, bytes_scanned={1:1.05 M}, files_opened={1:2}]
             ");
         });
         Ok(())

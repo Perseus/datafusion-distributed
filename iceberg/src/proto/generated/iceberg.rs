@@ -15,6 +15,12 @@ pub struct IcebergDataSource {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(bytes = "vec", optional, tag = "6")]
     pub custom_file_io: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Filters pushed into the scan, ANDed together.
+    #[prost(message, optional, tag = "7")]
+    pub filters: ::core::option::Option<::datafusion_proto::protobuf::PhysicalExprNode>,
+    /// Whether the scan reports its filters to dynamic filter producers.
+    #[prost(bool, tag = "8")]
+    pub should_report_filters: bool,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -36,6 +42,12 @@ pub struct ScanConfig {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(bytes = "vec", optional, tag = "5")]
     pub custom_file_io: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Filters pushed into the scan, ANDed together.
+    #[prost(message, optional, tag = "6")]
+    pub filters: ::core::option::Option<::datafusion_proto::protobuf::PhysicalExprNode>,
+    /// Whether the scan reports its filters to dynamic filter producers.
+    #[prost(bool, tag = "7")]
+    pub should_report_filters: bool,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
