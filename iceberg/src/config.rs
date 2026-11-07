@@ -21,7 +21,9 @@ extensions_options! {
         pub eager_file_planning: bool, default = false
         /// Balance eager files by bytes; false keeps task-first round-robin assignment.
         pub greedy_file_assignment: bool, default = true
-        /// (Experimental) Whether to enable dynamic filtering.
+        /// (Experimental) Whether Iceberg scans are consumers of the dynamic filters pushed
+        /// into them, so joins and aggregates compute those filters. Scans don't skip data
+        /// with them yet.
         pub dynamic_filtering_enabled: bool, default = false
     }
 }

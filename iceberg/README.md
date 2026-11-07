@@ -120,12 +120,12 @@ custom codecs must register both eager and lazy codecs plus `iceberg_scale_up`;
 `IcebergExt::with_iceberg_integration` installs these for the default codecs.
 
 Both scans keep the filters DataFusion pushes into them, including the dynamic
-filters that joins, top-N sorts and aggregates fill in while the query runs. Scans
+filters that joins, top-N sorts and aggregates compute while the query runs. Scans
 return `PushedDown::No` for these filters, so DataFusion still checks every row. `EXPLAIN`
-shows the dynamic ones on the scan as `dynamic_filters=`. 
-Joins and aggregates only fill the dynamic filters if there is a consumer for them -
-enabling `iceberg.dynamic_filtering_enabled` informs the producers 
-that the scan will consume them.
+shows the dynamic ones on the scan as `dynamic_filters=`. A join or aggregate only
+computes a dynamic filter when a scan below it is a consumer of that filter. Enable
+`iceberg.dynamic_filtering_enabled` to make Iceberg scans consumers of the dynamic
+filters pushed into them. Scans don't skip data with these filters yet.
 
 ```bash
 cargo test -p datafusion-distributed-iceberg -p datafusion-distributed-iceberg-test-tools
