@@ -21,7 +21,7 @@ extensions_options! {
         pub eager_file_planning: bool, default = false
         /// Balance eager files by bytes; false keeps task-first round-robin assignment.
         pub greedy_file_assignment: bool, default = true
-        /// Whether to enable dynamic filtering.
+        /// (Experimental) Whether to enable dynamic filtering.
         pub dynamic_filtering_enabled: bool, default = false
     }
 }
