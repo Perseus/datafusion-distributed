@@ -2,10 +2,6 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use datafusion::common::HashMap;
-use datafusion::physical_expr::{PhysicalExpr, conjunction};
-use datafusion::physical_expr_common::physical_expr::{
-    snapshot_generation, snapshot_physical_expr,
-};
 use iceberg::expr::{Bind, BoundPredicate, BoundReference, Predicate, PredicateOperator};
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{
@@ -13,48 +9,29 @@ use iceberg::spec::{
 };
 use iceberg::{Error, ErrorKind};
 
-use crate::table_provider::physical_predicate::convert_physical_filter_to_predicate;
-
 /// Skips files whose partition value can't match the scan's dynamic filters.
+#[derive(Default)]
 pub(crate) struct PartitionSkipper {
-    /// The scan's dynamic filters, combined with AND.
-    dynamic_filters: Arc<dyn PhysicalExpr>,
-
-    /// The generation of `dynamic_filters` that `predicate` was built from.
-    cached_snapshot_generation: u64,
-
-    /// The filters as an Iceberg predicate bound to the table schema.
-    predicate: Option<BoundPredicate>,
-
-    /// `predicate` projected onto each partition spec and bound to its partition schema, by spec
+    /// The filters projected onto each partition spec and bound to its partition schema, by spec
     /// id. `None` keeps every file written with that spec. That happens when the projection
-    /// matches every partition, or when the spec's partition values can't be checked. Cleared
-    /// when `predicate` changes.
+    /// matches every partition, or when the spec's partition values can't be checked.
     partition_predicates: HashMap<i32, Option<BoundPredicate>>,
 }
 
 impl PartitionSkipper {
-    pub(crate) fn new(dynamic_filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
-        Self {
-            dynamic_filters: conjunction(dynamic_filters),
-            cached_snapshot_generation: 0,
-            predicate: None,
-            partition_predicates: HashMap::new(),
-        }
-    }
-
-    /// Whether no row in the task's partition can match the filters. Any error keeps the file.
-    pub(crate) fn should_skip_task(&mut self, task: &FileScanTask) -> bool {
+    /// Whether no row in the task's partition can match `predicate`, the filters bound to the
+    /// table schema. Any error keeps the file.
+    pub(crate) fn should_skip_task(
+        &mut self,
+        predicate: &BoundPredicate,
+        task: &FileScanTask,
+    ) -> bool {
         let (Some(spec), Some(partition)) = (task.partition_spec(), task.partition()) else {
             return false;
         };
         if spec.is_unpartitioned() {
             return false;
         }
-        self.refresh(task);
-        let Some(predicate) = &self.predicate else {
-            return false;
-        };
         // Every task in a scan has the same table schema, so the spec id is enough as a key.
         let partition_predicate = self
             .partition_predicates
@@ -78,24 +55,9 @@ impl PartitionSkipper {
         }
     }
 
-    /// Rebuilds the predicate when any of the filters has changed.
-    fn refresh(&mut self, task: &FileScanTask) {
-        // Read the generation before taking the snapshot. If a filter changes in between, the
-        // next file sees a newer generation and rebuilds.
-        let generation = snapshot_generation(&self.dynamic_filters);
-        if self.cached_snapshot_generation == generation {
-            return;
-        }
-        self.cached_snapshot_generation = generation;
+    /// Forgets the projections. Called when the filters change.
+    pub(crate) fn clear(&mut self) {
         self.partition_predicates.clear();
-        self.predicate = snapshot_physical_expr(Arc::clone(&self.dynamic_filters))
-            .ok()
-            .and_then(|snapshot| convert_physical_filter_to_predicate(&snapshot))
-            .and_then(|predicate| {
-                predicate
-                    .bind(task.schema_ref(), task.case_sensitive())
-                    .ok()
-            });
     }
 }
 

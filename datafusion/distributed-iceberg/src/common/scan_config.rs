@@ -1,4 +1,4 @@
-use crate::common::dynamic_filters::partition_skipper::PartitionSkipper;
+use crate::common::dynamic_filters::pruner::DynamicFilterPruner;
 use crate::{IcebergConfig, common::df_err};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::stats::Precision;
@@ -37,6 +37,8 @@ pub(crate) struct ScanConfig {
     pub(crate) iceberg_runtime: iceberg::Runtime,
     pub(crate) filters: Option<Arc<dyn PhysicalExpr>>,
     pub(crate) dynamic_filtering_enabled: bool,
+    /// Whether the reader gets the dynamic filters for each file, to skip row groups with them.
+    reader_uses_dynamic_filters: bool,
     // Clones share the delete loader across this source's local partitions.
     reader: ArrowReader,
 }
@@ -66,6 +68,11 @@ impl ScanConfig {
             iceberg_runtime,
             filters: None,
             dynamic_filtering_enabled: config.dynamic_filtering_enabled,
+            // Without row group skipping, a filter only adds a check of every row. Page skipping
+            // gets rows wrong for columns whose type was widened, such as int to long, and a
+            // worker can't tell which columns were. So the reader doesn't get the filters then.
+            reader_uses_dynamic_filters: config.row_group_filtering_enabled
+                && !config.row_selection_enabled,
             reader,
         }
     }
@@ -114,16 +121,17 @@ impl ScanConfig {
             .with_category(MetricCategory::Bytes)
             .gauge("bytes_scanned", partition);
 
-        let mut partition_skipper = self.partition_skipper();
+        let mut pruner = self.dynamic_filter_pruner(partition);
         // The reader pulls a task when it starts reading that task's file. It reads ahead,
         // so with a LIMIT this can count files that never produced output. Skipped files
         // are dropped before this, so they aren't counted.
         let tasks = tasks
-            .try_filter(move |task| {
-                let skip = partition_skipper
-                    .as_mut()
-                    .is_some_and(|skipper| skipper.should_skip_task(task));
-                ready(!skip)
+            .try_filter_map(move |task| {
+                let task = match pruner.as_mut() {
+                    Some(pruner) => pruner.prune(task),
+                    None => Some(task),
+                };
+                ready(Ok(task))
             })
             .inspect_ok(move |_| files_opened.add(1))
             .boxed();
@@ -149,14 +157,24 @@ impl ScanConfig {
         Ok(Box::pin(LimitStream::new(stream, 0, self.fetch, metrics)))
     }
 
-    /// A skipper over the scan's dynamic filters. `None` when dynamic filtering is off or the
+    /// A pruner over the scan's dynamic filters. `None` when dynamic filtering is off or the
     /// scan has no dynamic filter.
-    fn partition_skipper(&self) -> Option<PartitionSkipper> {
+    fn dynamic_filter_pruner(&self, partition: usize) -> Option<DynamicFilterPruner> {
         if !self.dynamic_filtering_enabled {
             return None;
         }
         let dynamic_filters = dynamic_filters(self.filters.as_ref()?);
-        (!dynamic_filters.is_empty()).then(|| PartitionSkipper::new(dynamic_filters))
+        if dynamic_filters.is_empty() {
+            return None;
+        }
+        let files_with_dynamic_filter = MetricBuilder::new(&self.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("files_with_dynamic_filter", partition);
+        Some(DynamicFilterPruner::new(
+            dynamic_filters,
+            self.reader_uses_dynamic_filters,
+            files_with_dynamic_filter,
+        ))
     }
 }
 
@@ -186,6 +204,10 @@ impl fmt::Debug for ScanConfig {
             .field("iceberg_runtime", &self.iceberg_runtime)
             .field("filters", &self.filters)
             .field("dynamic_filtering_enabled", &self.dynamic_filtering_enabled)
+            .field(
+                "reader_uses_dynamic_filters",
+                &self.reader_uses_dynamic_filters,
+            )
             .finish_non_exhaustive()
     }
 }

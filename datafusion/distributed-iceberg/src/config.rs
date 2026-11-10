@@ -18,9 +18,11 @@ extensions_options! {
         pub column_stats_enabled: bool, default = false
         /// Discover and retain file tasks during physical planning instead of execution.
         pub eager_file_planning: bool, default = false
-        /// (Experimental) Whether Iceberg scans are consumers of the dynamic filters pushed
-        /// into them, so joins and aggregates compute those filters. Scans don't skip data
-        /// with them yet.
+        /// (Experimental) Whether Iceberg scans use the dynamic filters pushed into them, so
+        /// joins, sorts with a limit and aggregates compute those filters. Scans skip files
+        /// whose partition value can't match them. The reader also gets them for each file to
+        /// skip row groups, when `row_group_filtering_enabled` is on and
+        /// `row_selection_enabled` is off.
         pub dynamic_filtering_enabled: bool, default = false
     }
 }
