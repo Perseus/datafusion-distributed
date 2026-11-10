@@ -95,16 +95,16 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(DataSourceExec::from_data_source(
-            EagerIcebergDataSource::from_file_groups(
-                scan.schema,
-                groups,
-                scan.iceberg_file_io,
-                scan.iceberg_runtime,
-                scan.fetch,
-                ctx,
-            )?,
-        ))
+        let mut eager = EagerIcebergDataSource::from_file_groups(
+            scan.schema,
+            groups,
+            scan.iceberg_file_io,
+            scan.iceberg_runtime,
+            scan.fetch,
+            ctx,
+        )?;
+        eager.table = source.table;
+        Ok(DataSourceExec::from_data_source(eager))
     }
 
     fn try_encode(
@@ -138,6 +138,7 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
         let proto = pb::AssignedScan {
             config: Some(self.encode_config(source, proto_converter)?),
             partitions,
+            table: source.table.clone(),
         };
         proto.encode(buf).map_err(|error| {
             proto_error(format!("failed to encode EagerIcebergDataSource: {error}"))
@@ -209,12 +210,42 @@ impl EagerIcebergCodec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_plan::displayable;
     use datafusion::prelude::SessionConfig;
     use datafusion_distributed_iceberg_test_tools::create_taxi_table;
 
     use super::*;
     use crate::IcebergConfig;
     use crate::table_provider::scan::plan_scan;
+
+    #[tokio::test]
+    async fn decoded_scans_keep_the_table_name() -> Result<()> {
+        let taxi = create_taxi_table().await?;
+        let config = IcebergConfig {
+            eager_file_planning: true,
+            ..Default::default()
+        };
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_option_extension(config)),
+        );
+        let plan = plan_scan(
+            taxi.table().clone(),
+            taxi.schema()?,
+            Default::default(),
+            Arc::clone(&task_ctx),
+        )
+        .await?;
+        let codec = EagerIcebergCodec::default();
+        let proto_converter = datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {};
+
+        let mut buf = vec![];
+        codec.try_encode(plan, &mut buf, &proto_converter)?;
+        let decoded = codec.try_decode(&buf, &[], &task_ctx, &proto_converter)?;
+
+        insta::assert_snapshot!(displayable(decoded.as_ref()).one_line(), @"DataSourceExec: format=iceberg, table=default.taxi, planned_files=7");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn rejects_missing_config_and_invalid_assigned_groups() -> Result<()> {
@@ -244,6 +275,7 @@ mod tests {
         let missing = pb::AssignedScan {
             config: None,
             partitions: vec![],
+            table: None,
         }
         .encode_to_vec();
         assert!(
@@ -258,6 +290,7 @@ mod tests {
             let bytes = pb::AssignedScan {
                 config: Some(config.clone()),
                 partitions,
+                table: None,
             }
             .encode_to_vec();
             assert!(

@@ -44,6 +44,9 @@ pub struct AssignedScan {
     pub config: ::core::option::Option<ScanConfig>,
     #[prost(message, repeated, tag = "2")]
     pub partitions: ::prost::alloc::vec::Vec<FileGroup>,
+    /// The scanned table's name, for printing plans.
+    #[prost(string, optional, tag = "3")]
+    pub table: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

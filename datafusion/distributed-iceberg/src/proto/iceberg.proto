@@ -28,5 +28,7 @@ message ScanConfig {
 message AssignedScan {
   ScanConfig config = 1;
   repeated FileGroup partitions = 2;
+  // The scanned table's name, for printing plans.
+  optional string table = 3;
 }
 message FileGroup { repeated bytes tasks = 1; }
