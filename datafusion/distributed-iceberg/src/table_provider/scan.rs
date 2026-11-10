@@ -156,6 +156,7 @@ pub(crate) async fn plan_scan(
             statistics: Arc::new(statistics),
             files: planned,
             partitions: partitions.into(),
+            table: Some(table.identifier().to_string()),
         }));
     }
     let feed = WorkUnitFeed::new(IcebergWorkUnitFeed {

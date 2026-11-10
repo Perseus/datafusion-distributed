@@ -118,8 +118,8 @@ mod tests {
           │       [Stage 1] => NetworkBroadcastExec: partitions_per_consumer=1, stage_partitions=2, input_tasks=1
           │     FilterExec: trip_distance@0 >= 2, projection=[pickup_date@1]
           │       DistributedLeafExec:
-          │         t0: DataSourceExec: format=iceberg, planned_files=3, dynamic_filters=DynamicFilter [ pickup_date@1 >= 2024-01-10 AND pickup_date@1 <= 2024-01-10 AND pickup_date@1 IN (SET) ([2024-01-10]) ]
-          │         t1: DataSourceExec: format=iceberg, planned_files=4, dynamic_filters=DynamicFilter [ pickup_date@1 >= 2024-01-10 AND pickup_date@1 <= 2024-01-10 AND pickup_date@1 IN (SET) ([2024-01-10]) ]
+          │         t0: DataSourceExec: format=iceberg, table=default.taxi, planned_files=3, dynamic_filters=DynamicFilter [ pickup_date@1 >= 2024-01-10 AND pickup_date@1 <= 2024-01-10 AND pickup_date@1 IN (SET) ([2024-01-10]) ]
+          │         t1: DataSourceExec: format=iceberg, table=default.taxi, planned_files=4, dynamic_filters=DynamicFilter [ pickup_date@1 >= 2024-01-10 AND pickup_date@1 <= 2024-01-10 AND pickup_date@1 IN (SET) ([2024-01-10]) ]
           └──────────────────────────────────────────────────
             ┌───── Stage 1 ── tasks=1, partitions=2
             │ BroadcastExec: input_partitions=1, consumer_tasks=2, output_partitions=2

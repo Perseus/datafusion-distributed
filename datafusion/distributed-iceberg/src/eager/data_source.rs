@@ -26,6 +26,8 @@ pub struct EagerIcebergDataSource {
     pub(crate) statistics: Arc<Statistics>,
     pub(crate) files: Arc<PlannedFiles>,
     pub(crate) partitions: Arc<[Vec<usize>]>,
+    /// The scanned table's name, for printing plans. Unknown for scans built from file groups.
+    pub(crate) table: Option<String>,
 }
 impl EagerIcebergDataSource {
     /// Construct a scan from already selected files grouped by local output partition.
@@ -66,6 +68,7 @@ impl EagerIcebergDataSource {
             ),
             files: Arc::new(PlannedFiles::from_tasks(tasks, context)?),
             partitions: partitions.into(),
+            table: None,
         })
     }
 
@@ -165,9 +168,13 @@ impl DataSource for EagerIcebergDataSource {
         self.scan.open(tasks, partition)
     }
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "format=iceberg")?;
+        if let Some(table) = &self.table {
+            write!(f, ", table={table}")?;
+        }
         write!(
             f,
-            "format=iceberg, planned_files={}",
+            ", planned_files={}",
             self.partitions.iter().map(Vec::len).sum::<usize>()
         )?;
         if let Some(fetch) = self.scan.fetch {
