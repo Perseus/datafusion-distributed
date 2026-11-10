@@ -192,6 +192,7 @@ fn with_predicate(task: &FileScanTask, predicate: BoundPredicate) -> iceberg::Re
         .with_unified_partition_type(task.unified_partition_type().cloned())
         .with_sort_order_id(task.sort_order_id())
         .with_sort_order(task.sort_order().cloned())
+        .with_column_stats(task.column_stats().cloned())
         .with_case_sensitive(task.case_sensitive())
         .with_key_metadata(task.key_metadata().map(Box::from))
         .build()
@@ -307,6 +308,7 @@ mod tests {
         unified_partition_type
         sort_order_id
         sort_order
+        column_stats
         case_sensitive
         key_metadata
         ");
