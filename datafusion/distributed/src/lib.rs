@@ -79,3 +79,19 @@ pub use execution_plans::benchmarks::{
     LocalRepartitionBench, LocalRepartitionFixture, LocalRepartitionMode, ShuffleBench,
     ShuffleFixture, TransportBench, TransportBenchMode, TransportFixture,
 };
+
+/// Temporary, for measuring where query time goes: prints a timestamped line to stderr.
+#[doc(hidden)]
+pub fn timing(event: &str, details: std::fmt::Arguments<'_>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let thread = std::thread::current();
+    eprintln!(
+        "DFD_TIMING t={}.{:09} ev={event} thread={}/{:?} {details}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        thread.name().unwrap_or("-"),
+        thread.id(),
+    );
+}

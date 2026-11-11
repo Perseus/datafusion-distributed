@@ -99,6 +99,8 @@ impl pb::worker_service_server::WorkerService for Worker {
         request: Request<Streaming<pb::CoordinatorToWorkerMsg>>,
     ) -> Result<Response<Self::CoordinatorChannelStream>, Status> {
         let (metadata, _ext, mut body) = request.into_parts();
+        let handler_start = std::time::Instant::now();
+        crate::timing("w_handler_start", format_args!(""));
 
         let msg = body
             .message()
@@ -112,8 +114,18 @@ impl pb::worker_service_server::WorkerService for Worker {
             ));
         };
 
+        let plan_bytes = set_plan_request.plan_proto.len();
+        let body_ms = handler_start.elapsed().as_secs_f64() * 1000.0;
         let set_plan_request = decode_set_plan_request(set_plan_request)?;
         check_task_key_headers(&metadata, &set_plan_request.task_key)?;
+        let key = set_plan_request.task_key;
+        crate::timing(
+            "w_plan_received",
+            format_args!(
+                "q={} stage={} task={} bytes={plan_bytes} ms_waiting_for_body={body_ms:.1}",
+                key.query_id, key.stage_id, key.task_number
+            ),
+        );
 
         let input_stream = body
             .map_err(map_status_to_datafusion_error)
@@ -126,6 +138,16 @@ impl pb::worker_service_server::WorkerService for Worker {
             .coordinator_channel(metadata.into_headers(), set_plan_request, input_stream)
             .await
             .map_err(datafusion_error_to_tonic_status)?;
+        crate::timing(
+            "w_reply_sent",
+            format_args!(
+                "q={} stage={} task={} ms_since_handler_start={:.1}",
+                key.query_id,
+                key.stage_id,
+                key.task_number,
+                handler_start.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
 
         let output_stream = stream
             .map(move |msg| match msg {

@@ -151,11 +151,19 @@ impl<'a> StageCoordinator<'a> {
     )> {
         let session_config = self.task_ctx.session_config();
 
+        crate::timing(
+            "task_specialize_start",
+            format_args!("q={} stage={} task={task_i}", self.query_id, self.stage_id),
+        );
         let TaskSpecializedPlan {
             plan,
             work_unit_feed_declarations,
             dynamic_filter_remote_producer_ids,
         } = self.task_specialized_plan(task_i)?;
+        crate::timing(
+            "task_specialize_end",
+            format_args!("q={} stage={} task={task_i}", self.query_id, self.stage_id),
+        );
 
         let task_key = TaskKey {
             query_id: self.query_id,
@@ -255,11 +263,25 @@ impl<'a> StageCoordinator<'a> {
             dialer: &dialer,
         };
 
+        crate::timing(
+            "task_route_start",
+            format_args!("q={} stage={} task={task_i}", self.query_id, self.stage_id),
+        );
         let start = Instant::now();
         let Some(response) = RouteTaskHandlers::handle(ev).await.transpose()? else {
             return internal_err!("No RouteTaskHandler returned a response");
         };
         metrics.plan_send_latency.record(&start);
+        crate::timing(
+            "task_route_end",
+            format_args!(
+                "q={} stage={} task={task_i} url={} ms={:.1}",
+                self.query_id,
+                self.stage_id,
+                response.url,
+                start.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
 
         let Some(coordinator_to_worker_tx) = coordinator_to_worker_tx_slot.lock().unwrap().take()
         else {

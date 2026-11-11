@@ -218,6 +218,7 @@ impl ExecutionPlan for DistributedExec {
             );
         }
 
+        crate::timing("coord_execute_called", format_args!(""));
         let base_plan = Arc::clone(&self.base_plan);
         let prepared_plan = Arc::clone(&self.prepared_plan);
         let collect_dynamic_filters = self.completed_dynamic_filter_store.is_some();
@@ -247,10 +248,15 @@ impl ExecutionPlan for DistributedExec {
             let _guard = guard;
 
             let d_cfg = DistributedConfig::from_config_options(context.session_config().options())?;
+            crate::timing(
+                "coord_prepare_start",
+                format_args!("dynamic_task_count={}", d_cfg.dynamic_task_count),
+            );
             let mut prepared = match d_cfg.dynamic_task_count {
                 true => prepare_dynamic_plan(&query_coordinator, &base_plan).await?,
                 false => prepare_static_plan(&query_coordinator, &base_plan).await?,
             };
+            crate::timing("coord_prepare_end", format_args!(""));
 
             let dynamic_filtering_enabled =
                 is_local_dynamic_filtering_enabled(context.session_config());
@@ -266,11 +272,18 @@ impl ExecutionPlan for DistributedExec {
                 internal_datafusion_err!("DistributedExec was already prepared for execution")
             })?;
             let mut stream = head_stage.execute(partition, context)?;
+            crate::timing("coord_head_stage_executing", format_args!(""));
+            let mut first = true;
             while let Some(msg) = stream.next().await {
+                if first {
+                    crate::timing("coord_first_batch", format_args!(""));
+                    first = false;
+                }
                 if tx.send(Ok(msg?)).await.is_err() {
                     break; // channel closed
                 }
             }
+            crate::timing("coord_stream_end", format_args!(""));
             Ok(())
         });
 

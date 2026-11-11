@@ -63,6 +63,7 @@ impl QueryPlanner for DistributedQueryPlanner {
         logical_plan: &LogicalPlan,
         session: &dyn Session,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        crate::timing("dfd_planner_start", format_args!(""));
         let original_plan = match &self.prev {
             None => {
                 // Use the default physical planner.
@@ -71,8 +72,11 @@ impl QueryPlanner for DistributedQueryPlanner {
             }
             Some(prev) => prev.create_physical_plan(logical_plan, session).await?,
         };
+        crate::timing("dfd_single_node_plan_done", format_args!(""));
 
-        create_distributed_plan(original_plan, session).await
+        let plan = create_distributed_plan(original_plan, session).await;
+        crate::timing("dfd_distributed_plan_done", format_args!(""));
+        plan
     }
 }
 

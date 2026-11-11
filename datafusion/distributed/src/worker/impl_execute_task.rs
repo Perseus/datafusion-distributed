@@ -33,6 +33,17 @@ impl Worker {
             .map_err(|e| exec_datafusion_err!("Worker::execute_task timed-out while waiting for the plan to be set by the coordinator. ({e})"))?
             .map_err(DataFusionError::Shared)?;
         task_data.task_data_metrics.mark_execution_started_once();
+        crate::timing(
+            "w_execute_task",
+            format_args!(
+                "q={} stage={} task={} partitions={}..{}",
+                request.task_key.query_id,
+                request.task_key.stage_id,
+                request.task_key.task_number,
+                request.target_partition_start,
+                request.target_partition_end
+            ),
+        );
 
         let plan = task_data.plan(request.producer_head)?;
         let outcome_tracker = task_data.outcome_tracker;

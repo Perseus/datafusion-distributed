@@ -58,8 +58,28 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
     ) -> Result<BoxStream<'static, Result<WorkerToCoordinatorMsg>>> {
         let mut metadata = MetadataMap::from_headers(headers);
         set_task_key_headers(&mut metadata, &set_plan_request.task_key);
+        let key = set_plan_request.task_key;
+        let encode_start = std::time::Instant::now();
+        crate::timing(
+            "task_encode_start",
+            format_args!(
+                "q={} stage={} task={}",
+                key.query_id, key.stage_id, key.task_number
+            ),
+        );
         let set_plan_request = encode_set_plan_request(set_plan_request, ctx)?;
         let plan_bytes_sent = set_plan_request.plan_proto.len();
+        crate::timing(
+            "task_encode_end",
+            format_args!(
+                "q={} stage={} task={} bytes={plan_bytes_sent} ms={:.1}",
+                key.query_id,
+                key.stage_id,
+                key.task_number,
+                encode_start.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+        let call_start = std::time::Instant::now();
         let task_ctx = Arc::clone(ctx);
         // Tonic request streams cannot yield errors, so return encoding failures through
         // the response stream instead. Only the first failure matters.
@@ -92,6 +112,17 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
             ))
             .boxed() => response,
         };
+        crate::timing(
+            "task_reply_received",
+            format_args!(
+                "q={} stage={} task={} ok={} ms_since_call={:.1}",
+                key.query_id,
+                key.stage_id,
+                key.task_number,
+                response.is_ok(),
+                call_start.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         let output_stream = response
             .map_err(|err| {
                 if let Some(err) = tonic_status_to_datafusion_error(&err) {

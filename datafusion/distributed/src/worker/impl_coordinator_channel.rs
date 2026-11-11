@@ -98,15 +98,36 @@ impl Worker {
                     headers,
                 })
                 .await?;
+            crate::timing(
+                "w_session_built",
+                format_args!(
+                    "q={} stage={} task={}",
+                    key.query_id, key.stage_id, key.task_number
+                ),
+            );
 
             let task_ctx = session_state.task_ctx();
             let plan = request.plan.decode(&task_ctx)?;
+            crate::timing(
+                "w_plan_decoded",
+                format_args!(
+                    "q={} stage={} task={}",
+                    key.query_id, key.stage_id, key.task_number
+                ),
+            );
 
             let ev = WorkerPlanRewriteEvent {
                 plan,
                 session_config: session_state.config(),
             };
             let plan = WorkerPlanRewriteHandlers::handle(ev).await?.plan;
+            crate::timing(
+                "w_plan_rewritten",
+                format_args!(
+                    "q={} stage={} task={}",
+                    key.query_id, key.stage_id, key.task_number
+                ),
+            );
 
             // Initialize partition count to the number of partitions in the stage
             Ok::<_, DataFusionError>(TaskData {

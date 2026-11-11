@@ -41,12 +41,26 @@ pub(super) async fn prepare_static_plan(
                 vec![]
             };
 
+        crate::timing(
+            "stage_send_start",
+            format_args!(
+                "q={} stage={} tasks={}",
+                stage.query_id, stage.num, stage.tasks
+            ),
+        );
         let mut stage_coordinator = query_coordinator.stage_coordinator(stage);
         let mut futures = Vec::with_capacity(stage.tasks);
         for task_i in 0..stage.tasks {
             futures.push(stage_coordinator.init_bidirectional_stream(task_i));
         }
         let results = futures::future::try_join_all(futures).await?;
+        crate::timing(
+            "stage_send_end",
+            format_args!(
+                "q={} stage={} tasks={}",
+                stage.query_id, stage.num, stage.tasks
+            ),
+        );
 
         let mut workers = Vec::with_capacity(stage.tasks);
         for (task_i, (url, worker_tx, worker_stream)) in results.into_iter().enumerate() {

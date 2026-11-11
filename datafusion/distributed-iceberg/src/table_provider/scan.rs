@@ -35,6 +35,9 @@ pub(crate) async fn plan_scan(
     opts: IcebergDataSourceOptions<'_>,
     context: Arc<TaskContext>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let timing_table = table.identifier().to_string();
+    let timing_start = std::time::Instant::now();
+    datafusion_distributed::timing("ice_scan_start", format_args!("table={timing_table}"));
     let output_schema = match opts.projection {
         None => schema.clone(),
         Some(projection) => Arc::new(schema.project(projection)?),
@@ -113,6 +116,14 @@ pub(crate) async fn plan_scan(
     } else {
         None
     };
+    datafusion_distributed::timing(
+        "ice_files_planned",
+        format_args!(
+            "table={timing_table} files={} ms={:.1}",
+            planned.as_ref().map_or(0, |files| files.tasks().len()),
+            timing_start.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
     let may_filter_rows = predicates.is_some()
         || planned
             .as_ref()
@@ -151,6 +162,13 @@ pub(crate) async fn plan_scan(
         )?
         .pop()
         .expect("one task was assigned");
+        datafusion_distributed::timing(
+            "ice_scan_end",
+            format_args!(
+                "table={timing_table} ms={:.1}",
+                timing_start.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         return Ok(DataSourceExec::from_data_source(EagerIcebergDataSource {
             scan,
             statistics: Arc::new(statistics),

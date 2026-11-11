@@ -71,6 +71,7 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
                 inputs.len()
             );
         }
+        let timing_start = std::time::Instant::now();
         let source = pb::AssignedScan::decode(buf).map_err(|error| {
             proto_error(format!("failed to decode EagerIcebergDataSource: {error}"))
         })?;
@@ -106,6 +107,16 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
         eager.scan.filters = scan.filters;
         eager.scan.dynamic_filtering_enabled = scan.dynamic_filtering_enabled;
         eager.table = source.table;
+        datafusion_distributed::timing(
+            "ice_decode",
+            format_args!(
+                "table={} files={} bytes={} ms={:.2}",
+                eager.table.as_deref().unwrap_or("-"),
+                eager.files.tasks().len(),
+                buf.len(),
+                timing_start.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         Ok(DataSourceExec::from_data_source(eager))
     }
 
@@ -124,6 +135,7 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
         let Some(source) = exec.data_source().downcast_ref::<EagerIcebergDataSource>() else {
             return internal_err!("expected DataSourceExec wrapping EagerIcebergDataSource");
         };
+        let timing_start = std::time::Instant::now();
         let partitions = (0..source.output_partitioning().partition_count())
             .map(|partition| {
                 let tasks = source
@@ -142,9 +154,20 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
             partitions,
             table: source.table.clone(),
         };
-        proto.encode(buf).map_err(|error| {
+        let assigned_files: usize = proto.partitions.iter().map(|group| group.tasks.len()).sum();
+        let result = proto.encode(buf).map_err(|error| {
             proto_error(format!("failed to encode EagerIcebergDataSource: {error}"))
-        })
+        });
+        datafusion_distributed::timing(
+            "ice_encode",
+            format_args!(
+                "table={} files={assigned_files} bytes={} ms={:.2}",
+                source.table.as_deref().unwrap_or("-"),
+                buf.len(),
+                timing_start.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+        result
     }
 }
 
