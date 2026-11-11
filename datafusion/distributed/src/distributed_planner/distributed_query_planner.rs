@@ -107,6 +107,7 @@ pub fn create_distributed_plan(
             };
         }
 
+        let mut lap = std::time::Instant::now();
         let session_cfg = session.config();
         let cfg = session_cfg.options();
         let d_cfg = DistributedConfig::from_config_options(cfg)?;
@@ -141,14 +142,19 @@ pub fn create_distributed_plan(
         let mut plan = Arc::clone(&original_plan);
 
         let cfg = session.config_options();
+        crate::timing_lap("setup", &mut lap);
         plan = normalize_collect_joins(plan, cfg)?;
+        crate::timing_lap("normalize_collect_joins", &mut lap);
 
         if plan.output_partitioning().partition_count() > 1 {
             plan = Arc::new(CoalescePartitionsExec::new(plan));
         }
+        crate::timing_lap("coalesce_partitions_wrap", &mut lap);
 
         plan = insert_broadcast_execs(plan, cfg)?;
+        crate::timing_lap("insert_broadcast_execs", &mut lap);
         plan = insert_children_isolator_unions(plan, cfg)?;
+        crate::timing_lap("insert_children_isolator_unions", &mut lap);
 
         if d_cfg.dynamic_task_count {
             // The task count will be decided dynamically at execution time.
@@ -158,16 +164,24 @@ pub fn create_distributed_plan(
         // Compute per-node task counts and inject `Network*Exec` nodes at the stage boundaries.
         plan = inject_network_boundaries(plan, CardinalityBasedNetworkBoundaryBuilder, session_cfg)
             .await?;
+        crate::timing_lap("inject_network_boundaries", &mut lap);
 
         plan = prepare_network_boundaries(plan)?;
-        if !plan.exists(|plan| Ok(plan.is_network_boundary()))? {
+        crate::timing_lap("prepare_network_boundaries", &mut lap);
+        let has_boundary = plan.exists(|plan| Ok(plan.is_network_boundary()))?;
+        crate::timing_lap("exists_network_boundary", &mut lap);
+        if !has_boundary {
             return Ok(original_plan);
         }
 
         let plan = partial_reduce_below_network_shuffles(plan, cfg)?;
+        crate::timing_lap("partial_reduce_below_network_shuffles", &mut lap);
         let plan = push_fetch_into_network_coalesce(plan)?;
+        crate::timing_lap("push_fetch_into_network_coalesce", &mut lap);
 
-        Ok(create_distributed_exec(Arc::clone(&plan), d_cfg))
+        let exec = create_distributed_exec(Arc::clone(&plan), d_cfg);
+        crate::timing_lap("create_distributed_exec", &mut lap);
+        Ok(exec)
     })
 }
 

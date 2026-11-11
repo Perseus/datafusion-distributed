@@ -95,3 +95,13 @@ pub fn timing(event: &str, details: std::fmt::Arguments<'_>) {
         thread.id(),
     );
 }
+
+/// Temporary: prints how long a pass took since `*start`, then restarts the clock.
+#[doc(hidden)]
+pub fn timing_lap(pass: &str, start: &mut std::time::Instant) {
+    timing(
+        "dfd_pass",
+        format_args!("pass={pass} ms={:.3}", start.elapsed().as_secs_f64() * 1e3),
+    );
+    *start = std::time::Instant::now();
+}

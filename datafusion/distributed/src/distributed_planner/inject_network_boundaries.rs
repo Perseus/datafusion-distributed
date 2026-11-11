@@ -29,8 +29,9 @@ use datafusion::prelude::SessionConfig;
 use std::any::TypeId;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Walks an [ExecutionPlan] and injects [NetworkShuffleExec], [NetworkBroadcastExec], and
@@ -143,6 +144,23 @@ use uuid::Uuid;
 /// boundary injection, so the head stage is closed by running one final Phase 2 pass over
 /// the whole plan. This guarantees every node (including head-stage nodes that never sat
 /// directly above a boundary) has a task count recorded.
+/// Temporary timing: summed call time and call count of the sub-steps of boundary injection.
+/// Concurrent futures can overlap, so the sums can exceed the wall time.
+const SUB_STEPS: [&str; 4] = [
+    "desired_task_count",
+    "nb_builder_build",
+    "final_propagate",
+    "replace_children",
+];
+const SUB_ZERO: AtomicU64 = AtomicU64::new(0);
+static SUB_NS: [AtomicU64; 4] = [SUB_ZERO; 4];
+static SUB_CALLS: [AtomicU64; 4] = [SUB_ZERO; 4];
+
+fn sub_add(step: usize, start: Instant) {
+    SUB_NS[step].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SUB_CALLS[step].fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) async fn inject_network_boundaries(
     plan: Arc<dyn ExecutionPlan>,
     nb_builder: impl NetworkBoundaryBuilder + Send + Sync,
@@ -158,7 +176,22 @@ pub(crate) async fn inject_network_boundaries(
         stage_id: &AtomicUsize::new(1),
     };
 
-    _inject_network_boundaries(plan, None, &ctx).await
+    for i in 0..SUB_STEPS.len() {
+        SUB_NS[i].store(0, Ordering::Relaxed);
+        SUB_CALLS[i].store(0, Ordering::Relaxed);
+    }
+    let result = _inject_network_boundaries(plan, None, &ctx).await;
+    for (i, name) in SUB_STEPS.iter().enumerate() {
+        crate::timing(
+            "dfd_inject_substep",
+            format_args!(
+                "step={name} ms={:.3} calls={}",
+                SUB_NS[i].load(Ordering::Relaxed) as f64 / 1e6,
+                SUB_CALLS[i].load(Ordering::Relaxed)
+            ),
+        );
+    }
+    result
 }
 
 type ConcurrentHashMap<K, V> = Mutex<HashMap<K, V>>;
@@ -258,8 +291,10 @@ async fn _inject_network_boundaries(
         // This is a leaf node, maybe a DataSourceExec, or maybe something else custom from the user.
         // If we could not determine how many tasks this leaf node should run on, we need to assume
         // it cannot be distributed and use just 1 task.
-        DesiredTaskCountHandlers::handle(ev)
-            .await
+        let t = Instant::now();
+        let handled = DesiredTaskCountHandlers::handle(ev).await;
+        sub_add(0, t);
+        handled
             .transpose()?
             .map(|v| v.task_count)
             .unwrap_or(TaskCountAnnotation::exact(NonZeroUsize::MIN, 0.0))
@@ -336,8 +371,10 @@ async fn _inject_network_boundaries(
         }
         task_count
     } else {
-        let mut task_count = DesiredTaskCountHandlers::handle(ev)
-            .await
+        let t = Instant::now();
+        let handled = DesiredTaskCountHandlers::handle(ev).await;
+        sub_add(0, t);
+        let mut task_count = handled
             .transpose()?
             .map(|v| v.task_count)
             .unwrap_or(TaskCountAnnotation::soft(0.0));
@@ -347,10 +384,12 @@ async fn _inject_network_boundaries(
         task_count
     };
 
+    let t = Instant::now();
     let plan = plan.replace_children(
         processed_children,
         ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
     )?;
+    sub_add(3, t);
     // Cap the reconciled task count by the configured max-per-stage budget.
     let max_tasks = nb_ctx.max_tasks()?;
     if let Some(min) = task_count.get_min()
@@ -373,10 +412,13 @@ async fn _inject_network_boundaries(
             tasks: task_count.as_usize(),
             metrics_set: Default::default(),
         };
+        let t = Instant::now();
         let result = nb_ctx
             .nb_builder
             .build(input_stage, TypeId::of::<NetworkShuffleExec>(), nb_ctx)
-            .await?;
+            .await;
+        sub_add(1, t);
+        let result = result?;
         let shuffle = Arc::new(NetworkShuffleExec::from_stage(
             result.input_stage,
             result.input_properties,
@@ -392,10 +434,13 @@ async fn _inject_network_boundaries(
             tasks: task_count.as_usize(),
             metrics_set: Default::default(),
         };
+        let t = Instant::now();
         let result = nb_ctx
             .nb_builder
             .build(input_stage, TypeId::of::<NetworkBroadcastExec>(), nb_ctx)
-            .await?;
+            .await;
+        sub_add(1, t);
+        let result = result?;
         let nb = Arc::new(NetworkBroadcastExec::from_stage(
             result.input_stage,
             result.input_properties,
@@ -414,10 +459,13 @@ async fn _inject_network_boundaries(
             tasks: task_count.as_usize(),
             metrics_set: Default::default(),
         };
+        let t = Instant::now();
         let result = nb_ctx
             .nb_builder
             .build(input_stage, TypeId::of::<NetworkCoalesceExec>(), nb_ctx)
-            .await?;
+            .await;
+        sub_add(1, t);
+        let result = result?;
         if result.consumer_task_count.restriction != TaskCountRestriction::Exact(NonZeroUsize::MIN)
         {
             return plan_err!("A NetworkCoalesceExec must return an exact task count of 1");
@@ -435,7 +483,10 @@ async fn _inject_network_boundaries(
         // We've just finished walking the head stage's subplan. Run a final propagation so
         // every node in the head stage (which never crossed a stage boundary on the way up)
         // gets its task count recorded.
-        nb_ctx.propagate_task_count_until_network_boundaries(&plan, task_count)
+        let t = Instant::now();
+        let propagated = nb_ctx.propagate_task_count_until_network_boundaries(&plan, task_count);
+        sub_add(2, t);
+        propagated
     } else {
         // If this is not the root node, and it's also not a network boundary, then we don't need
         // to do anything else.
