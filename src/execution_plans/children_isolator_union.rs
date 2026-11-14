@@ -12,8 +12,8 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, ExecutionPlanProperties,
-    Partitioning, PlanProperties,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan,
+    ExecutionPlanProperties, Partitioning, PlanProperties, ReplaceChildrenOptions,
 };
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
@@ -257,6 +257,17 @@ impl ExecutionPlan for ChildrenIsolatorUnionExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         if children.len() != self.children.len() {
             return plan_err!(
                 "Number of children must match the original plan, have {} but expected {}",
@@ -264,11 +275,22 @@ impl ExecutionPlan for ChildrenIsolatorUnionExec {
                 self.children.len()
             );
         }
-        Ok(Arc::new(Self::from_children_and_annotations(
-            children,
-            self.child_annotations.clone(),
-            self.task_idx_map.len(),
-        )?))
+        match options.children_properties {
+            // The children's partition counts are unchanged, so the task assignment and the
+            // properties derived from them still hold.
+            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
+                properties: Arc::clone(&self.properties),
+                metrics: ExecutionPlanMetricsSet::default(),
+                children,
+                child_annotations: self.child_annotations.clone(),
+                task_idx_map: self.task_idx_map.clone(),
+            })),
+            ChildrenPropertiesMode::Recompute => Ok(Arc::new(Self::from_children_and_annotations(
+                children,
+                self.child_annotations.clone(),
+                self.task_idx_map.len(),
+            )?)),
+        }
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1108,6 +1130,33 @@ mod tests {
             err.to_string().contains("requires 3 tasks"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn replace_children_keeps_properties_when_asked() -> Result<(), Box<dyn std::error::Error>> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let child = || Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+        let union = Arc::new(ChildrenIsolatorUnionExec::from_children_and_annotations(
+            [child(), child(), child()],
+            [soft(1.0), soft(1.0), soft(1.0)],
+            2,
+        )?);
+
+        let keep = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep);
+        let replaced =
+            Arc::clone(&union).replace_children(vec![child(), child(), child()], keep)?;
+        let replaced = replaced
+            .downcast_ref::<ChildrenIsolatorUnionExec>()
+            .expect("still a ChildrenIsolatorUnionExec");
+        assert!(Arc::ptr_eq(&union.properties, &replaced.properties));
+        assert_eq!(union.task_idx_map, replaced.task_idx_map);
+
+        let recompute = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute);
+        let replaced =
+            Arc::clone(&union).replace_children(vec![child(), child(), child()], recompute)?;
+        assert!(!Arc::ptr_eq(&union.properties, replaced.properties()));
+        Ok(())
     }
 
     fn ctx(task_index: usize, task_count: usize) -> DistributedTaskContext {

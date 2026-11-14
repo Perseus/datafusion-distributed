@@ -68,11 +68,21 @@ impl ExecutionPlan for MetricsWrapperExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    /// Passes `options` on to the wrapped node, so it can reuse its cached properties when the
+    /// caller says the children's properties did not change.
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(MetricsWrapperExec {
-            inner: Arc::clone(&self.inner).replace_children(
-                children.clone(),
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-            )?,
+            inner: Arc::clone(&self.inner).replace_children(children, options)?,
             metrics: self.metrics.clone(),
         }))
     }
@@ -119,5 +129,33 @@ impl ExecutionPlan for MetricsWrapperExec {
 
     fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
         Some(self.inner.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    #[test]
+    fn replace_children_passes_options_to_inner() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let leaf = || Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+        let inner = Arc::new(CoalescePartitionsExec::new(leaf())) as Arc<dyn ExecutionPlan>;
+        let wrapper = Arc::new(MetricsWrapperExec::new(
+            Arc::clone(&inner),
+            MetricsSet::new(),
+        ));
+
+        let keep = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep);
+        let replaced = Arc::clone(&wrapper).replace_children(vec![leaf()], keep)?;
+        assert!(Arc::ptr_eq(inner.properties(), replaced.properties()));
+
+        let recompute = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute);
+        let replaced = wrapper.replace_children(vec![leaf()], recompute)?;
+        assert!(!Arc::ptr_eq(inner.properties(), replaced.properties()));
+        Ok(())
     }
 }
