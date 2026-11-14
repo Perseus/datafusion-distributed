@@ -38,6 +38,8 @@ pub(crate) struct ScanConfig {
     pub(crate) iceberg_runtime: iceberg::Runtime,
     pub(crate) filters: Option<Arc<dyn PhysicalExpr>>,
     pub(crate) dynamic_filtering_enabled: bool,
+    /// Whether the reader gets the dynamic filters for each file, to skip row groups with them.
+    reader_uses_dynamic_filters: bool,
     // Clones share the delete loader across this source's local partitions.
     reader: ArrowReader,
 }
@@ -67,6 +69,11 @@ impl ScanConfig {
             iceberg_runtime,
             filters: None,
             dynamic_filtering_enabled: config.dynamic_filtering_enabled,
+            // Without row group skipping, a filter only adds a check of every row. Page skipping
+            // gets rows wrong for columns whose type was widened, such as int to long, and a
+            // worker can't tell which columns were. So the reader doesn't get the filters then.
+            reader_uses_dynamic_filters: config.row_group_filtering_enabled
+                && !config.row_selection_enabled,
             reader,
         }
     }
@@ -188,8 +195,14 @@ impl ScanConfig {
             return None;
         }
         let dynamic_filters = dynamic_filters(self.filters.as_ref()?);
-        (!dynamic_filters.is_empty())
-            .then(|| DynamicFilterPruner::new(dynamic_filters, &self.metrics, partition))
+        (!dynamic_filters.is_empty()).then(|| {
+            DynamicFilterPruner::new(
+                dynamic_filters,
+                &self.metrics,
+                partition,
+                self.reader_uses_dynamic_filters,
+            )
+        })
     }
 }
 
@@ -219,6 +232,10 @@ impl fmt::Debug for ScanConfig {
             .field("iceberg_runtime", &self.iceberg_runtime)
             .field("filters", &self.filters)
             .field("dynamic_filtering_enabled", &self.dynamic_filtering_enabled)
+            .field(
+                "reader_uses_dynamic_filters",
+                &self.reader_uses_dynamic_filters,
+            )
             .finish_non_exhaustive()
     }
 }
