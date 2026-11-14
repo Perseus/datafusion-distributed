@@ -42,9 +42,10 @@ pub(super) async fn prepare_static_plan(
             };
 
         let mut stage_coordinator = query_coordinator.stage_coordinator(stage);
+        let prepared_tasks = stage_coordinator.prepare_tasks()?;
         let mut futures = Vec::with_capacity(stage.tasks);
-        for task_i in 0..stage.tasks {
-            futures.push(stage_coordinator.init_bidirectional_stream(task_i));
+        for (task_i, prepared) in prepared_tasks.into_iter().enumerate() {
+            futures.push(stage_coordinator.init_bidirectional_stream(task_i, prepared));
         }
         let results = futures::future::try_join_all(futures).await?;
 

@@ -1,4 +1,4 @@
-use crate::codec::roundtrip_pb;
+use crate::codec::{encode_execution_plan, roundtrip_pb};
 use crate::common::{TreeNodeExt, now_ns, task_ctx_with_extension};
 use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::DynamicFilterRegistry;
@@ -144,6 +144,7 @@ impl<'a> StageCoordinator<'a> {
     pub(super) async fn init_bidirectional_stream(
         &self,
         task_i: usize,
+        prepared: PreparedTask,
     ) -> Result<(
         Url,
         UnboundedSender<CoordinatorToWorkerMsg>,
@@ -151,11 +152,17 @@ impl<'a> StageCoordinator<'a> {
     )> {
         let session_config = self.task_ctx.session_config();
 
-        let TaskSpecializedPlan {
-            plan,
-            work_unit_feed_declarations,
-            dynamic_filter_remote_producer_ids,
-        } = self.task_specialized_plan(task_i)?;
+        let PreparedTask {
+            specialized:
+                TaskSpecializedPlan {
+                    plan,
+                    work_unit_feed_declarations,
+                    dynamic_filter_remote_producer_ids,
+                },
+            encoded_plan,
+        } = prepared;
+        let local_worker_url =
+            LocalWorkerContext::from_ctx(self.task_ctx).map(|lw| lw.self_url.clone());
 
         let task_key = TaskKey {
             query_id: self.query_id,
@@ -199,10 +206,17 @@ impl<'a> StageCoordinator<'a> {
                     .take_until(self.spawner.query_finished().cancelled_owned())
                     .boxed();
 
+            // Remote workers get the bytes encoded in `prepare_tasks`. The local worker reads the
+            // plan directly.
+            let plan_for_worker = if local_worker_url.as_ref() == Some(&url) {
+                MaybeEncoded::Decoded(Arc::clone(&plan))
+            } else {
+                MaybeEncoded::Encoded(encoded_plan.clone())
+            };
             let set_plan_request = SetPlanRequest {
                 task_key,
                 task_count: self.task_count,
-                plan: MaybeEncoded::Decoded(Arc::clone(&plan)),
+                plan: plan_for_worker,
                 dynamic_filter_remote_producer_ids: dynamic_filter_remote_producer_ids.clone(),
                 work_unit_feed_declarations: work_unit_feed_declarations.clone(),
                 target_worker_url: url.clone(),
@@ -456,8 +470,84 @@ impl<'a> StageCoordinator<'a> {
     /// trimming down any unnecessary information that the specific `task_i` task is not going to
     /// need, like unexecuted branches in [ChildrenIsolatorUnionExec], or unexecuted variants of
     /// [DistributedLeafExec].
-    fn task_specialized_plan(&self, task_i: usize) -> Result<TaskSpecializedPlan> {
-        let session_config = self.task_ctx.session_config();
+    /// Specializes and encodes the plan of every task in this stage, spread over several threads.
+    ///
+    /// Each task gets its own copy of the plan, and encoding a plan with many file scans takes
+    /// tens of milliseconds. Doing it one task at a time on the coordinator delays the start of
+    /// the last task by the sum of all of them.
+    pub(super) fn prepare_tasks(&self) -> Result<Vec<PreparedTask>> {
+        let (plan, task_ctx, task_count) = (self.plan, self.task_ctx, self.task_count);
+        run_in_parallel(task_count, |task_i| {
+            let specialized = task_specialized_plan(plan, task_ctx, task_count, task_i)?;
+            let encoded_plan = encode_execution_plan(Arc::clone(&specialized.plan), task_ctx)?;
+            Ok(PreparedTask {
+                specialized,
+                encoded_plan,
+            })
+        })
+    }
+}
+
+/// Runs `f` for every index in `0..count` on up to one thread per core and returns the results
+/// in index order.
+fn run_in_parallel<T: Send>(count: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(count);
+    if threads <= 1 {
+        return (0..count).map(f).collect();
+    }
+    let run = || {
+        std::thread::scope(|scope| {
+            let f = &f;
+            let workers = (0..threads)
+                .map(|t| {
+                    scope.spawn(move || {
+                        (t..count)
+                            .step_by(threads)
+                            .map(|i| (i, f(i)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut results = (0..count).map(|_| None).collect::<Vec<_>>();
+            for worker in workers {
+                let Ok(done) = worker.join() else {
+                    return internal_err!("a thread preparing distributed tasks panicked");
+                };
+                for (i, result) in done {
+                    results[i] = Some(result);
+                }
+            }
+            results
+                .into_iter()
+                .map(|r| r.unwrap_or_else(|| internal_err!("distributed task was not prepared")))
+                .collect()
+        })
+    };
+    // Lets the runtime move other tasks off this thread while it waits for the work.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(run)
+        }
+        _ => run(),
+    }
+}
+
+/// A task's specialized plan, with the same plan already encoded for remote workers.
+pub(super) struct PreparedTask {
+    specialized: TaskSpecializedPlan,
+    encoded_plan: Vec<u8>,
+}
+
+fn task_specialized_plan(
+    plan: &Arc<dyn ExecutionPlan>,
+    task_ctx: &Arc<TaskContext>,
+    task_count: usize,
+    task_i: usize,
+) -> Result<TaskSpecializedPlan> {
+    {
+        let session_config = task_ctx.session_config();
         let wuf_registry = session_config
             .get_extension::<WorkUnitFeedRegistry>()
             .unwrap_or_default();
@@ -467,10 +557,10 @@ impl<'a> StageCoordinator<'a> {
         let mut work_unit_feed_declarations = vec![];
         let d_ctx = DistributedTaskContext {
             task_index: task_i,
-            task_count: self.task_count,
+            task_count,
         };
 
-        let plan = Arc::clone(self.plan);
+        let plan = Arc::clone(plan);
         let transformed = plan.transform_down_with_dt_ctx(d_ctx, |plan, d_ctx| {
             if let Some(wuf) = wuf_registry.get_work_unit_feed(&plan) {
                 work_unit_feed_declarations.push(WorkUnitFeedDeclaration {
@@ -484,7 +574,7 @@ impl<'a> StageCoordinator<'a> {
                 //
                 // Doing this roundtrip here is not super clean, but it transitions the feed with
                 // very little specialized code.
-                let plan = roundtrip_pb(plan, self.task_ctx)?;
+                let plan = roundtrip_pb(plan, task_ctx)?;
                 return Ok(Transformed::yes(plan));
             };
 
@@ -515,7 +605,7 @@ impl<'a> StageCoordinator<'a> {
         let plan = if dynamic_filtering_enabled {
             maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships(
                 Arc::clone(&transformed.data),
-                self.task_ctx,
+                task_ctx,
             )?
         } else {
             transformed.data
