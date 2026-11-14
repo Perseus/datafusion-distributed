@@ -3,7 +3,7 @@ use crate::common::TreeNodeExt;
 use crate::coordinator::DistributedExec;
 use crate::dynamic_filtering::{
     apply_dynamic_filter_update, discover_dynamic_filter_consumers,
-    discover_dynamic_filter_producers,
+    discover_dynamic_filter_producers, has_dynamic_filters,
 };
 use crate::execution_plans::DistributedLeafExec;
 use crate::stage::{Stage, find_all_stages};
@@ -139,7 +139,7 @@ pub async fn rewrite_distributed_plan_with_dynamic_filters(
 ///          t1: DataSourceExec:  predicate=DynamicFilter [ f_dkey@2 < B ] <- unique filter
 /// ```
 ///
-/// This is done by deep-copying every leaf variant so we don't have to
+/// This is done by deep-copying every leaf variant that has dynamic filters so we don't have to
 /// worry about any shared state.
 ///
 /// [`update()`]: DynamicFilterPhysicalExpr::update()
@@ -153,15 +153,26 @@ pub(crate) fn sever_dynamic_filter_relationships_in_plan_for_display(
             return Ok(Transformed::no(node));
         };
 
+        let mut changed = false;
         let variants = leaf
             .variants()
             .iter()
             .map(|variant| {
+                // A variant without dynamic filters shares no filter state with other tasks, so
+                // it can be reused as is. Leaving the node untouched also keeps `transform_up`
+                // from rebuilding every ancestor.
+                if !has_dynamic_filters(variant)? {
+                    return Ok(Arc::clone(variant));
+                }
+                changed = true;
                 let variant = roundtrip_pb(Arc::clone(variant), task_ctx)?;
                 // The variant can have a SortExec
                 isolate_sort_dynamic_filters_for_display(variant, task_ctx)
             })
             .collect::<Result<Vec<_>>>()?;
+        if !changed {
+            return Ok(Transformed::no(node));
+        }
 
         Ok(Transformed::yes(Arc::new(DistributedLeafExec::try_new(
             Arc::clone(leaf.original()),
@@ -251,4 +262,27 @@ fn apply_filters_to_distributed_leaves(
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+    #[test]
+    fn sever_keeps_plans_without_dynamic_filters() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let scan = || Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+        let leaf = DistributedLeafExec::try_new(scan(), [scan(), scan()])?;
+        let plan = Arc::new(CoalescePartitionsExec::new(Arc::new(leaf))) as Arc<dyn ExecutionPlan>;
+
+        let severed = sever_dynamic_filter_relationships_in_plan_for_display(
+            Arc::clone(&plan),
+            &Arc::new(TaskContext::default()),
+        )?;
+
+        assert!(Arc::ptr_eq(&plan, &severed));
+        Ok(())
+    }
 }

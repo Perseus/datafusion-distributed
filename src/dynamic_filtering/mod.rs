@@ -178,14 +178,17 @@ pub(crate) fn maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationshi
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: &Arc<TaskContext>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let has_producers = !discover_dynamic_filter_producers(&plan)?.is_empty();
-    let has_consumers = !discover_dynamic_filter_consumers(&plan)?
-        .consumers
-        .is_empty();
-
-    if has_producers || has_consumers {
+    if has_dynamic_filters(&plan)? {
         roundtrip_pb(plan, task_ctx)
     } else {
         Ok(plan)
     }
+}
+
+/// Returns true if `plan` produces or consumes any dynamic filter.
+pub(crate) fn has_dynamic_filters(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    Ok(!discover_dynamic_filter_producers(plan)?.is_empty()
+        || !discover_dynamic_filter_consumers(plan)?
+            .consumers
+            .is_empty())
 }
