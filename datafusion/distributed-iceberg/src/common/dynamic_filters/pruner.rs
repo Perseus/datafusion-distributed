@@ -13,9 +13,11 @@ use iceberg::scan::FileScanTask;
 
 use crate::common::dynamic_filters::partition_filter::PartitionFilter;
 use crate::common::dynamic_filters::physical_predicate::convert_physical_filter_to_predicate;
+use crate::common::dynamic_filters::row_group_filter::with_dynamic_filter;
 
 /// Uses the scan's dynamic filters on each file just before the reader starts it. Skips files
-/// whose partition value can't match the filters.
+/// whose partition value can't match the filters, and can give the reader the filters for the
+/// rest.
 pub(crate) struct DynamicFilterPruner {
     /// The scan's dynamic filters, combined with AND.
     dynamic_filters: Arc<dyn PhysicalExpr>,
@@ -33,6 +35,9 @@ pub(crate) struct DynamicFilterPruner {
 
     /// The files checked. Pruned files were skipped and matched files were kept.
     files: PruningMetrics,
+
+    /// Whether the reader gets the filters for each file, to skip row groups with them.
+    reader_uses_dynamic_filters: bool,
 }
 
 impl DynamicFilterPruner {
@@ -40,6 +45,7 @@ impl DynamicFilterPruner {
         dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
+        reader_uses_dynamic_filters: bool,
     ) -> Self {
         Self {
             dynamic_filters: conjunction(dynamic_filters),
@@ -49,6 +55,7 @@ impl DynamicFilterPruner {
             files: MetricBuilder::new(metrics)
                 .with_type(MetricType::Summary)
                 .pruning_metrics("files_pruned_by_partition", partition),
+            reader_uses_dynamic_filters,
         }
     }
 
@@ -59,7 +66,14 @@ impl DynamicFilterPruner {
             return None;
         }
         self.files.add_matched(1);
-        Some(task)
+        if !self.reader_uses_dynamic_filters {
+            return Some(task);
+        }
+        self.refresh();
+        let Some(predicate) = &self.predicate else {
+            return Some(task);
+        };
+        Some(with_dynamic_filter(&task, predicate).unwrap_or(task))
     }
 
     /// Whether no row in the task's partition can match the filters.
