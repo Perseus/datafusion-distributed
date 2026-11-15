@@ -143,14 +143,23 @@ pub(crate) async fn plan_scan(
         if let Some(column_stats) = column_stats {
             apply_column_statistics(&mut statistics, column_stats);
         }
+        // Like DataFusion's file scans, use no more partitions than files. Each partition is a
+        // stream that every operator above the scan sets up and drains, even when it's empty, and
+        // a union of many small scans multiplies them.
+        let partition_count = partitioning
+            .partition_count()
+            .min(planned.tasks().len())
+            .max(1);
         let partitions = assign_files(
             planned.tasks().iter(),
             1,
-            partitioning.partition_count(),
+            partition_count,
             IcebergConfig::from_task_context(&context).greedy_file_assignment,
         )?
         .pop()
         .expect("one task was assigned");
+        let mut scan = scan;
+        scan.partitioning = Partitioning::UnknownPartitioning(partition_count);
         return Ok(DataSourceExec::from_data_source(EagerIcebergDataSource {
             scan,
             statistics: Arc::new(statistics),

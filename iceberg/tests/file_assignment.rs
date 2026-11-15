@@ -178,7 +178,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_scan_keeps_local_partitions() -> Result<(), Box<dyn Error>> {
+    async fn scan_uses_no_more_partitions_than_files() -> Result<(), Box<dyn Error>> {
+        // Each inner array is one commit, with one file per row count.
+        let harness = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(table_of_files([[3_000, 10_000]]).await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .configure_session(|mut state| {
+                let session = state.config().get_or_insert_default();
+                session.options_mut().execution.target_partitions = 4;
+                Ok(state)
+            })?
+            .build()
+            .await?;
+        let plan = harness.scan().await?;
+        insta::assert_snapshot!(assignments(&plan)?, @"
+        task 0: 127231 bytes
+          partition 0: [1-00001.parquet (98128 bytes)]
+          partition 1: [1-00000.parquet (29103 bytes)]
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_scan_has_one_partition() -> Result<(), Box<dyn Error>> {
         // Each inner array is one commit, with one file per row count.
         let harness = IcebergTestHarness::builder()
             .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
@@ -195,7 +218,6 @@ mod tests {
         insta::assert_snapshot!(assignments(&plan)?, @"
         task 0: 0 bytes
           partition 0: []
-          partition 1: []
         ");
         Ok(())
     }
