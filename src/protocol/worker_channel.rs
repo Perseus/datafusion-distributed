@@ -97,6 +97,10 @@ pub struct SetPlanRequest {
     /// Producer expression IDs whose consumers cross a network boundary. Workers observe and
     /// report updates to the coordinator.
     pub dynamic_filter_remote_producer_ids: Vec<u64>,
+    /// Expression IDs of the dynamic filters this task consumes that a hash join in another task
+    /// produces. The task waits for them before it starts. Empty when tasks don't wait. See
+    /// [crate::DistributedConfig::dynamic_filter_wait_timeout_ms].
+    pub remote_join_dynamic_filter_ids: Vec<u64>,
     /// Information about all the work unit feeds that will be streamed from coordinator to worker.
     /// This information is needed here because at the moment of setting the plan, all the appropriate
     /// channels for the incoming work unit feeds need to be constructed.

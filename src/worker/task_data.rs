@@ -1,5 +1,6 @@
 use crate::common::OnceLockResult;
 use crate::common::now_ns;
+use crate::worker::dynamic_filter_wait::DynamicFilterWait;
 use crate::{MaxLatencyMetric, ProducerHead, TaskCompletedDynamicFilters, TaskMetrics};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
@@ -30,11 +31,14 @@ pub struct TaskData {
     /// associated to a specific node, they are global to the task, like the time at which the plan
     /// was fed by the coordinator to the worker.
     pub(super) task_data_metrics: Arc<TaskDataMetrics>,
+    /// The dynamic filters the task waits for before it starts. `None` when it doesn't wait.
+    pub(super) dynamic_filter_wait: Option<DynamicFilterWait>,
 }
 
 pub(crate) const PLAN_ADDED_AT_METRIC: &str = "plan_added_at";
 pub(crate) const PLAN_EXECUTED_AT_METRIC: &str = "plan_executed_at";
 pub(crate) const PLAN_FINISHED_AT_METRIC: &str = "plan_finished_at";
+pub(crate) const DYNAMIC_FILTER_WAIT_TIME_METRIC: &str = "dynamic_filter_wait_time";
 
 #[derive(Debug)]
 pub(super) struct TaskDataMetrics {
@@ -45,6 +49,8 @@ pub(super) struct TaskDataMetrics {
     pub(super) plan_executed_at: MaxLatencyMetric,
     /// When the execution stream finished.
     pub(super) plan_finished_at: MaxLatencyMetric,
+    /// The longest time a partition waited for dynamic filters before it started.
+    pub(super) dynamic_filter_wait_time: MaxLatencyMetric,
 }
 
 impl TaskDataMetrics {
@@ -58,6 +64,7 @@ impl TaskDataMetrics {
             plan_added_at,
             plan_finished_at: MaxLatencyMetric::default(),
             plan_executed_at: MaxLatencyMetric::default(),
+            dynamic_filter_wait_time: MaxLatencyMetric::default(),
         }
     }
 
@@ -89,6 +96,13 @@ impl TaskDataMetrics {
             PLAN_FINISHED_AT_METRIC,
             &self.plan_finished_at,
         ));
+        // Only tasks that waited for dynamic filters report the wait.
+        if self.dynamic_filter_wait_time.value() > 0 {
+            metrics_set.push(max_latency_metric(
+                DYNAMIC_FILTER_WAIT_TIME_METRIC,
+                &self.dynamic_filter_wait_time,
+            ));
+        }
 
         metrics_set
     }

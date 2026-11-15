@@ -539,6 +539,7 @@ fn encode_set_plan_request(
         target_worker_url: request.target_worker_url.to_string(),
         query_start_time_ns: request.query_start_time_ns as u64,
         dynamic_filter_remote_producer_ids: request.dynamic_filter_remote_producer_ids,
+        remote_join_dynamic_filter_ids: request.remote_join_dynamic_filter_ids,
     })
 }
 
