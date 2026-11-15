@@ -156,6 +156,14 @@ impl DynamicFilterRegistry {
         // We can safely ignore anchors because they are not evaluated by network boundaries. This
         // means they do not need updates forwarded to them.
         let consumers = discover_dynamic_filter_consumers(task_specialized_plan)?.consumers;
+        eprintln!(
+            "DFDBG {} register_task stage={} task={} producers={:?} consumers={:?}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            task_key.stage_id,
+            task_key.task_number,
+            producers.iter().map(|(id, mode, _)| (*id, *mode)).collect::<Vec<_>>(),
+            consumers.iter().map(|c| c.id).collect::<Vec<_>>()
+        );
 
         let mut state = self.state.lock().expect("dynamic filter registry poisoned");
         for (id, merge_mode, producer_schema) in producers {
@@ -246,6 +254,14 @@ impl DynamicFilterRegistry {
             );
         }
 
+        eprintln!(
+            "DFDBG {} coord_recv stage={} task={} id={} complete={}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            task_key.stage_id,
+            task_key.task_number,
+            report.expression_id,
+            dynamic_filter.is_complete
+        );
         let mut state = self.state.lock().expect("dynamic filter registry poisoned");
         let Some(filter) = state.filters.get_mut(&report.expression_id) else {
             return exec_err!(
@@ -293,6 +309,21 @@ impl DynamicFilterRegistry {
                     && report.as_ref().is_some_and(|report| report.is_complete)
             });
         if mode == DynamicFilterMergePolicy::UnionWhenAllComplete && !all_complete {
+            eprintln!(
+                "DFDBG {} merge_wait id={} producers={:?}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+                id,
+                filter
+                    .producers
+                    .iter()
+                    .map(|(t, r)| (
+                        t.stage_id,
+                        t.task_number,
+                        state.sealed_stages.contains(&t.stage_id),
+                        r.as_ref().map(|r| r.is_complete)
+                    ))
+                    .collect::<Vec<_>>()
+            );
             return false;
         }
 
@@ -366,8 +397,22 @@ impl DynamicFilterRegistry {
                 continue;
             }
             let Some(sender) = state.task_senders.get(&task_key) else {
+                eprintln!(
+                    "DFDBG {} dispatch_no_sender id={} stage={} task={}",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+                    id,
+                    task_key.stage_id,
+                    task_key.task_number
+                );
                 continue;
             };
+            eprintln!(
+                "DFDBG {} dispatch id={} stage={} task={}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+                id,
+                task_key.stage_id,
+                task_key.task_number
+            );
             let update = CoordinatorToWorkerMsg::ApplyDynamicFilter(Box::new(ApplyDynamicFilter {
                 expression_id: id,
                 expression: MaybeEncoded::Encoded(expression.clone()),

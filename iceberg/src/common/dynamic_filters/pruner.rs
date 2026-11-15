@@ -57,6 +57,14 @@ impl DynamicFilterPruner {
     /// or matched
     pub(crate) fn should_prune(&mut self, task: &FileScanTask) -> bool {
         let prune = self.can_skip(task);
+        eprintln!(
+            "DFDBG {} scan_open file={} generation={} filters={:.300} prune={}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            task.data_file_path().rsplit('/').next().unwrap_or(""),
+            snapshot_generation(&self.dynamic_filters),
+            format!("{}", self.dynamic_filters),
+            prune
+        );
         if prune {
             self.files.add_pruned(1);
         } else {
@@ -141,5 +149,11 @@ impl DynamicFilterPruner {
         self.predicate = snapshot_physical_expr(Arc::clone(&self.dynamic_filters))
             .ok()
             .and_then(|snapshot| convert_physical_filter_to_predicate(&snapshot));
+        eprintln!(
+            "DFDBG {} scan_refresh generation={} predicate={:.300}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            generation,
+            format!("{:?}", self.predicate)
+        );
     }
 }

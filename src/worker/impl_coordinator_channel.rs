@@ -144,9 +144,19 @@ impl Worker {
             .iter()
             .copied()
             .collect();
-        let producer_filters = discover_dynamic_filter_producers(&task_data.base_plan)?
+        let all_producers = discover_dynamic_filter_producers(&task_data.base_plan)?;
+        eprintln!(
+            "DFDBG {} worker_setup stage={} task={} remote_ids={:?} producers={:?}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            key.stage_id,
+            key.task_number,
+            dynamic_filter_remote_producer_ids,
+            all_producers.iter().map(|p| p.id).collect::<Vec<_>>()
+        );
+        let producer_filters = all_producers
             .into_iter()
-            .filter(|producer| dynamic_filter_remote_producer_ids.contains(&producer.id));
+            .filter(|producer| dynamic_filter_remote_producer_ids.contains(&producer.id))
+            .collect::<Vec<_>>();
         let dynamic_filter_consumers: HashMap<_, _> =
             discover_dynamic_filter_consumers(&task_data.base_plan)?
                 .consumers
@@ -209,6 +219,14 @@ impl Worker {
                         sampler_gate.kick_off();
                     }
                     CoordinatorToWorkerMsg::ApplyDynamicFilter(filter) => {
+                        eprintln!(
+                            "DFDBG {} worker_apply stage={} task={} id={} known={}",
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+                            key.stage_id,
+                            key.task_number,
+                            filter.expression_id,
+                            dynamic_filter_consumers.contains_key(&filter.expression_id)
+                        );
                         let result = dynamic_filter_consumers
                             .get(&filter.expression_id)
                             .ok_or_else(|| {
@@ -317,6 +335,8 @@ impl Worker {
                     producer.id,
                     producer.expression,
                     producer_cancel_rx.clone(),
+                    key.stage_id,
+                    key.task_number,
                 )
             }));
 
@@ -360,6 +380,8 @@ fn produced_dynamic_filter_stream(
     expression_id: u64,
     expression: Arc<dyn PhysicalExpr>,
     cancel_rx: watch::Receiver<bool>,
+    dbg_stage: usize,
+    dbg_task: usize,
 ) -> BoxStream<'static, WorkerToCoordinatorMsg> {
     futures::stream::unfold(Some((expression, cancel_rx)), move |state| async move {
         let (expression, mut cancel_rx) = state?;
@@ -376,6 +398,15 @@ fn produced_dynamic_filter_stream(
             _ = dynamic_filter.wait_complete() => true,
             _ = cancel_rx.wait_for(|cancelled| *cancelled) => return None,
         };
+        eprintln!(
+            "DFDBG {} worker_send stage={} task={} id={} complete={} expr={:.300}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            dbg_stage,
+            dbg_task,
+            expression_id,
+            completed,
+            format!("{}", expression)
+        );
         let message =
             WorkerToCoordinatorMsg::ProducedDynamicFilter(Box::new(ProducedDynamicFilter {
                 expression_id,
