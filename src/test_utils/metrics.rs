@@ -50,3 +50,37 @@ fn timestamp_from_nanos(nanos: i64) -> Timestamp {
     timestamp.set(DateTime::<Utc>::from_timestamp_nanos(nanos));
     timestamp
 }
+
+/// Sums the values of the metrics named `metric_name` on the `index`th node of type `T`.
+pub fn node_metrics<T: ExecutionPlan + 'static>(
+    plan: &Arc<dyn ExecutionPlan>,
+    metric_name: &str,
+    mut index: usize,
+) -> usize {
+    use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+    let mut metrics = None;
+    Arc::clone(plan)
+        .transform_down(|plan| {
+            if plan.name() == T::static_name() {
+                metrics = plan.metrics();
+                if index == 0 {
+                    return Ok(Transformed::new(plan, false, TreeNodeRecursion::Stop));
+                }
+                index -= 1;
+            }
+            Ok(Transformed::no(plan))
+        })
+        .unwrap();
+    let metrics =
+        metrics.unwrap_or_else(|| panic!("Could not find metrics for plan {}", T::static_name()));
+    let summed = metrics
+        .iter()
+        .filter(|v| v.value().name().starts_with(metric_name))
+        .map(|v| v.value().as_usize())
+        .sum();
+    assert!(
+        summed > 0,
+        "Sum of metric values is 0. Either the metric {metric_name} is not present or the test is too trivial"
+    );
+    summed
+}

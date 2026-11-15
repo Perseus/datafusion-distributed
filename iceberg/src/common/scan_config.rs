@@ -11,9 +11,12 @@ use datafusion::physical_expr::{Partitioning, PhysicalExpr, conjunction, split_c
 use datafusion::physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::limit::LimitStream;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory, MetricType,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::TryStreamExt;
+use futures::stream::poll_fn;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTaskStream;
