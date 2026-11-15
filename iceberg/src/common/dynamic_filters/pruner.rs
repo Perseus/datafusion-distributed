@@ -13,9 +13,11 @@ use iceberg::scan::FileScanTask;
 
 use crate::common::dynamic_filters::partition_filter::PartitionFilter;
 use crate::common::dynamic_filters::physical_predicate::convert_physical_filter_to_predicate;
+use crate::common::dynamic_filters::row_group_filter::with_dynamic_filter;
 
-/// Uses the scan's dynamic filters on each file just before the reader starts it. Skips files
-/// whose partition value can't match the filters.
+/// Applies the scan's dynamic filters to each file just before the reader opens it. It skips
+/// files whose partition value can't match the filters. For the other files, it can add the
+/// filters to the file's own filter, so the reader can skip row groups.
 pub(crate) struct DynamicFilterPruner {
     /// The scan's dynamic filters, combined with AND.
     dynamic_filters: Arc<dyn PhysicalExpr>,
@@ -61,6 +63,16 @@ impl DynamicFilterPruner {
             self.files.add_matched(1);
         }
         prune
+    }
+
+    /// Adds the dynamic filters to the task's own filter, so the reader can use them to skip row
+    /// groups. Returns the task unchanged if that fails.
+    pub(crate) fn with_reader_filter(&mut self, task: FileScanTask) -> FileScanTask {
+        self.refresh();
+        let Some(predicate) = &self.predicate else {
+            return task;
+        };
+        with_dynamic_filter(&task, predicate).unwrap_or(task)
     }
 
     /// Whether no row in the task's partition can match the filters.

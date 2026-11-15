@@ -21,9 +21,11 @@ extensions_options! {
         pub eager_file_planning: bool, default = false
         /// Balance eager files by bytes; false keeps task-first round-robin assignment.
         pub greedy_file_assignment: bool, default = true
-        /// (Experimental) Whether Iceberg scans are consumers of the dynamic filters pushed
-        /// into them, so joins and aggregates compute those filters. Scans don't skip data
-        /// with them yet.
+        /// (Experimental) Whether Iceberg scans use the dynamic filters pushed into them. When
+        /// on, joins, sorts with a limit and aggregates build these filters while the query
+        /// runs. Scans use them to skip files whose partition value can't match. When
+        /// `row_group_filtering_enabled` is on and `row_selection_enabled` is off, the reader
+        /// also uses them to skip row groups.
         pub dynamic_filtering_enabled: bool, default = false
     }
 }

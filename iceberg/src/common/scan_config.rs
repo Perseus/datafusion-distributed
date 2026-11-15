@@ -35,6 +35,8 @@ pub(crate) struct ScanConfig {
     pub(crate) iceberg_runtime: iceberg::Runtime,
     pub(crate) filters: Option<Arc<dyn PhysicalExpr>>,
     pub(crate) dynamic_filtering_enabled: bool,
+    /// Whether the reader also gets the dynamic filters, so it can skip row groups.
+    reader_uses_dynamic_filters: bool,
     // Clones share the delete loader across this source's local partitions.
     reader: ArrowReader,
 }
@@ -64,6 +66,14 @@ impl ScanConfig {
             iceberg_runtime,
             filters: None,
             dynamic_filtering_enabled: config.dynamic_filtering_enabled,
+            // The reader only gets the dynamic filters when it can use them to skip row groups:
+            // - With row group filtering off, the filters can't skip anything. The reader would
+            //   just check them against every row.
+            // - With page skipping (`row_selection_enabled`) on, iceberg-rust can skip the wrong
+            //   pages for a column whose type was widened, like int to long. A worker can't tell
+            //   which columns were widened.
+            reader_uses_dynamic_filters: config.row_group_filtering_enabled
+                && !config.row_selection_enabled,
             reader,
         }
     }
@@ -143,15 +153,22 @@ impl ScanConfig {
             .gauge("bytes_scanned", partition);
 
         let mut pruner = self.dynamic_filter_pruner(partition);
+        let reader_uses_dynamic_filters = self.reader_uses_dynamic_filters;
         // The reader pulls a task when it starts reading that task's file. It reads ahead,
         // so with a LIMIT this can count files that never produced output. Skipped files
         // are dropped before this, and the pruner counts them.
         let tasks = tasks
-            .try_filter(move |task| {
-                let prune = pruner
-                    .as_mut()
-                    .is_some_and(|pruner| pruner.should_prune(task));
-                ready(!prune)
+            .try_filter_map(move |task| {
+                let Some(pruner) = pruner.as_mut() else {
+                    return ready(Ok(Some(task)));
+                };
+                if pruner.should_prune(&task) {
+                    return ready(Ok(None));
+                }
+                if !reader_uses_dynamic_filters {
+                    return ready(Ok(Some(task)));
+                }
+                ready(Ok(Some(pruner.with_reader_filter(task))))
             })
             .inspect_ok(move |_| files_opened.add(1))
             .boxed();
@@ -215,6 +232,10 @@ impl fmt::Debug for ScanConfig {
             .field("iceberg_runtime", &self.iceberg_runtime)
             .field("filters", &self.filters)
             .field("dynamic_filtering_enabled", &self.dynamic_filtering_enabled)
+            .field(
+                "reader_uses_dynamic_filters",
+                &self.reader_uses_dynamic_filters,
+            )
             .finish_non_exhaustive()
     }
 }
