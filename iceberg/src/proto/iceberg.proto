@@ -28,5 +28,8 @@ message ScanConfig {
 message AssignedScan {
   ScanConfig config = 1;
   repeated FileGroup partitions = 2;
+  // Values that many files share, like the table schema, written once for the scan.
+  bytes shared_file_values = 3;
 }
+// Each task is one file, which refers to the scan's shared values by position.
 message FileGroup { repeated bytes tasks = 1; }

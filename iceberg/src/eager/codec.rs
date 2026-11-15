@@ -5,7 +5,7 @@ use crate::file_io_codec::FileIOCodec;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::{Result, exec_datafusion_err, internal_err};
+use datafusion::common::{Result, internal_err};
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
@@ -19,6 +19,7 @@ use iceberg::io::StorageFactory;
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use prost::Message;
 
+use crate::eager::file_tasks::{FileTaskDecoder, FileTaskEncoder};
 use crate::proto::generated::iceberg as pb;
 
 /// Physical plan codec for [`EagerIcebergDataSource`].
@@ -80,18 +81,15 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
         {
             return internal_err!("Iceberg assigned files do not match scan partitioning");
         }
+        let mut decoder = FileTaskDecoder::new(&source.shared_file_values)?;
         let groups = source
             .partitions
             .into_iter()
             .map(|group| {
                 group
                     .tasks
-                    .into_iter()
-                    .map(|bytes| {
-                        rmp_serde::from_slice(&bytes).map_err(|error| {
-                            exec_datafusion_err!("Invalid assigned Iceberg file: {error}")
-                        })
-                    })
+                    .iter()
+                    .map(|bytes| decoder.decode(bytes))
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
@@ -122,15 +120,12 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
         let Some(source) = exec.data_source().downcast_ref::<EagerIcebergDataSource>() else {
             return internal_err!("expected DataSourceExec wrapping EagerIcebergDataSource");
         };
+        let mut encoder = FileTaskEncoder::default();
         let partitions = (0..source.output_partitioning().partition_count())
             .map(|partition| {
                 let tasks = source
                     .planned_partition_tasks(partition)?
-                    .map(|file| {
-                        rmp_serde::to_vec_named(file).map_err(|error| {
-                            exec_datafusion_err!("Cannot encode assigned Iceberg file: {error}")
-                        })
-                    })
+                    .map(|file| encoder.encode(file))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(pb::FileGroup { tasks })
             })
@@ -138,6 +133,7 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
         let proto = pb::AssignedScan {
             config: Some(self.encode_config(source, proto_converter)?),
             partitions,
+            shared_file_values: encoder.finish()?,
         };
         proto.encode(buf).map_err(|error| {
             proto_error(format!("failed to encode EagerIcebergDataSource: {error}"))
@@ -217,6 +213,57 @@ mod tests {
     use crate::table_provider::scan::plan_scan;
 
     #[tokio::test]
+    async fn roundtrips_assigned_files() -> Result<()> {
+        let taxi = create_taxi_table().await?;
+        let config = IcebergConfig {
+            eager_file_planning: true,
+            ..Default::default()
+        };
+        let task_ctx = TaskContext::default()
+            .with_session_config(SessionConfig::new().with_option_extension(config));
+        let plan = plan_scan(
+            taxi.table().clone(),
+            taxi.schema()?,
+            Default::default(),
+            Arc::new(task_ctx),
+        )
+        .await?;
+        let codec = EagerIcebergCodec::default();
+        let proto_converter = datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {};
+        let mut buf = vec![];
+        codec.try_encode(Arc::clone(&plan), &mut buf, &proto_converter)?;
+        let decoded = codec.try_decode(&buf, &[], &TaskContext::default(), &proto_converter)?;
+
+        let files = |plan: &Arc<dyn ExecutionPlan>| {
+            let source = plan
+                .downcast_ref::<DataSourceExec>()
+                .unwrap()
+                .data_source()
+                .downcast_ref::<EagerIcebergDataSource>()
+                .unwrap();
+            (0..source.output_partitioning().partition_count())
+                .map(|p| {
+                    source
+                        .planned_partition_tasks(p)
+                        .unwrap()
+                        .cloned()
+                        .collect()
+                })
+                .collect::<Vec<Vec<_>>>()
+        };
+        let (original, decoded) = (files(&plan), files(&decoded));
+        assert!(original.iter().flatten().count() > 1);
+        assert!(
+            original
+                .iter()
+                .flatten()
+                .all(|file| file.partition().is_some())
+        );
+        assert_eq!(decoded, original);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejects_missing_config_and_invalid_assigned_groups() -> Result<()> {
         let taxi = create_taxi_table().await?;
         let config = IcebergConfig {
@@ -244,6 +291,7 @@ mod tests {
         let missing = pb::AssignedScan {
             config: None,
             partitions: vec![],
+            shared_file_values: vec![],
         }
         .encode_to_vec();
         assert!(
@@ -258,6 +306,7 @@ mod tests {
             let bytes = pb::AssignedScan {
                 config: Some(config.clone()),
                 partitions,
+                shared_file_values: FileTaskEncoder::default().finish()?,
             }
             .encode_to_vec();
             assert!(

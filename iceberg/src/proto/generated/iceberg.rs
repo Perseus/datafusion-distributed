@@ -44,7 +44,11 @@ pub struct AssignedScan {
     pub config: ::core::option::Option<ScanConfig>,
     #[prost(message, repeated, tag = "2")]
     pub partitions: ::prost::alloc::vec::Vec<FileGroup>,
+    /// Values that many files share, like the table schema, written once for the scan.
+    #[prost(bytes = "vec", tag = "3")]
+    pub shared_file_values: ::prost::alloc::vec::Vec<u8>,
 }
+/// Each task is one file, which refers to the scan's shared values by position.
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileGroup {

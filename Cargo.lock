@@ -2501,6 +2501,8 @@ dependencies = [
  "parquet",
  "prost",
  "rmp-serde",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",

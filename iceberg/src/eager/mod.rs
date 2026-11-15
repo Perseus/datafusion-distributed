@@ -1,5 +1,6 @@
 mod codec;
 mod data_source;
+mod file_tasks;
 pub(crate) mod planned_files;
 
 pub use codec::EagerIcebergCodec;
