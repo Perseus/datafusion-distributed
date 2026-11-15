@@ -5,6 +5,7 @@ use datafusion::common::{Result, exec_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::{TryStreamExt, stream};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,8 @@ impl Worker {
         let plan = task_data.plan(request.producer_head)?;
         let outcome_tracker = task_data.outcome_tracker;
         let task_ctx = task_data.task_ctx;
+        let dynamic_filter_wait = task_data.dynamic_filter_wait;
+        let task_data_metrics = task_data.task_data_metrics;
         let partition_count = plan.properties().partitioning.partition_count();
         let plan_name = plan.name();
 
@@ -51,7 +54,27 @@ impl Worker {
                 );
             }
 
-            let stream = outcome_tracker.track(plan.execute(partition, Arc::clone(&task_ctx))?);
+            let stream = match &dynamic_filter_wait {
+                None => plan.execute(partition, Arc::clone(&task_ctx))?,
+                // Execute the partition only after the wait. Some nodes start reading their input
+                // as soon as they are executed.
+                Some(wait) => {
+                    let wait = wait.clone();
+                    let deferred_plan = Arc::clone(&plan);
+                    let task_ctx = Arc::clone(&task_ctx);
+                    let task_data_metrics = Arc::clone(&task_data_metrics);
+                    let stream = stream::once(async move {
+                        let waited = wait.wait().await;
+                        task_data_metrics
+                            .dynamic_filter_wait_time
+                            .add_duration(waited);
+                        deferred_plan.execute(partition, task_ctx)
+                    })
+                    .try_flatten();
+                    Box::pin(RecordBatchStreamAdapter::new(plan.schema(), stream))
+                }
+            };
+            let stream = outcome_tracker.track(stream);
             let stream_schema = plan.schema();
 
             streams.push(Box::pin(RecordBatchStreamAdapter::new(stream_schema, stream)) as _);

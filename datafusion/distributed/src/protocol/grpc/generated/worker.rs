@@ -180,6 +180,10 @@ pub struct SetPlanRequest {
     /// Producer IDs whose updates must be reported to the coordinator for remote consumers.
     #[prost(uint64, repeated, tag = "8")]
     pub dynamic_filter_remote_producer_ids: ::prost::alloc::vec::Vec<u64>,
+    /// IDs of the dynamic filters this task consumes that a hash join in another task produces. The
+    /// task waits for them before it starts. Empty when tasks don't wait.
+    #[prost(uint64, repeated, tag = "9")]
+    pub remote_join_dynamic_filter_ids: ::prost::alloc::vec::Vec<u64>,
 }
 /// Nested message and enum types in `SetPlanRequest`.
 pub mod set_plan_request {

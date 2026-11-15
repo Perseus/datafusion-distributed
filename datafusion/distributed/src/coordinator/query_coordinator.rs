@@ -9,6 +9,7 @@ use crate::dynamic_filtering::{
     dynamic_filter_remote_producer_ids, is_local_dynamic_filtering_enabled,
     is_remote_dynamic_filtering_enabled,
     maybe_roundtrip_plan_to_sever_in_memory_dynamic_filter_relationships,
+    remote_join_dynamic_filter_ids,
 };
 use crate::events::{
     RouteTaskEvent, RouteTaskEventResponse, RouteTaskHandlers, new_coordinator_to_worker_dialer,
@@ -24,10 +25,10 @@ use crate::{
     MaybeEncoded, SetPlanRequest, TaskCompletedDynamicFilters, TaskKey, TaskMetrics,
     WorkUnitFeedDeclaration, WorkerToCoordinatorMsg, get_distributed_channel_resolver,
 };
-use datafusion::common::Result;
 use datafusion::common::instant::Instant;
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, internal_err};
+use datafusion::common::{HashSet, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr_common::metrics::{ExecutionPlanMetricsSet, Label, MetricBuilder};
 use datafusion::physical_plan::metrics::Count;
@@ -61,6 +62,9 @@ pub(super) struct QueryCoordinator {
     metrics_store: Option<Arc<Store<TaskMetrics>>>,
     completed_dynamic_filter_store: Option<Arc<Store<TaskCompletedDynamicFilters>>>,
     dynamic_filter_registry: Arc<DynamicFilterRegistry>,
+    /// The dynamic filters that hash joins produce in worker stages, when tasks wait for them.
+    /// Empty otherwise. See [crate::DistributedConfig::dynamic_filter_wait_timeout_ms].
+    worker_join_dynamic_filter_ids: HashSet<u64>,
     pub(super) spawner: Spawner,
 }
 
@@ -71,6 +75,7 @@ impl QueryCoordinator {
         metrics_set: &ExecutionPlanMetricsSet,
         metrics_store: Option<Arc<Store<TaskMetrics>>>,
         completed_dynamic_filter_store: Option<Arc<Store<TaskCompletedDynamicFilters>>>,
+        worker_join_dynamic_filter_ids: HashSet<u64>,
         output: &mut RecordBatchReceiverStreamBuilder,
     ) -> Self {
         let spawner = Spawner::new(output);
@@ -84,6 +89,7 @@ impl QueryCoordinator {
                 spawner.query_finished(),
             )),
             coordinator_to_worker_metrics: CoordinatorToWorkerMetrics::new(metrics_set),
+            worker_join_dynamic_filter_ids,
             spawner,
         }
     }
@@ -102,6 +108,7 @@ impl QueryCoordinator {
             metrics_store: &self.metrics_store,
             completed_dynamic_filter_store: &self.completed_dynamic_filter_store,
             dynamic_filter_registry: &self.dynamic_filter_registry,
+            worker_join_dynamic_filter_ids: &self.worker_join_dynamic_filter_ids,
             spawner: &self.spawner,
         }
     }
@@ -131,6 +138,7 @@ pub(super) struct StageCoordinator<'a> {
     metrics_store: &'a Option<Arc<Store<TaskMetrics>>>,
     completed_dynamic_filter_store: &'a Option<Arc<Store<TaskCompletedDynamicFilters>>>,
     dynamic_filter_registry: &'a Arc<DynamicFilterRegistry>,
+    worker_join_dynamic_filter_ids: &'a HashSet<u64>,
     spawner: &'a Spawner,
 }
 
@@ -155,6 +163,7 @@ impl<'a> StageCoordinator<'a> {
             plan,
             work_unit_feed_declarations,
             dynamic_filter_remote_producer_ids,
+            remote_join_dynamic_filter_ids,
         } = self.task_specialized_plan(task_i)?;
 
         let task_key = TaskKey {
@@ -204,6 +213,7 @@ impl<'a> StageCoordinator<'a> {
                 task_count: self.task_count,
                 plan: MaybeEncoded::Decoded(Arc::clone(&plan)),
                 dynamic_filter_remote_producer_ids: dynamic_filter_remote_producer_ids.clone(),
+                remote_join_dynamic_filter_ids: remote_join_dynamic_filter_ids.clone(),
                 work_unit_feed_declarations: work_unit_feed_declarations.clone(),
                 target_worker_url: url.clone(),
                 query_start_time_ns: self.metrics.instantiation_time,
@@ -491,10 +501,16 @@ impl<'a> StageCoordinator<'a> {
             } else {
                 vec![]
             };
+        let remote_join_dynamic_filter_ids = if self.worker_join_dynamic_filter_ids.is_empty() {
+            vec![]
+        } else {
+            remote_join_dynamic_filter_ids(&plan, self.worker_join_dynamic_filter_ids)?
+        };
         Ok(TaskSpecializedPlan {
             plan,
             work_unit_feed_declarations,
             dynamic_filter_remote_producer_ids,
+            remote_join_dynamic_filter_ids,
         })
     }
 }
@@ -503,6 +519,7 @@ struct TaskSpecializedPlan {
     plan: Arc<dyn ExecutionPlan>,
     work_unit_feed_declarations: Vec<WorkUnitFeedDeclaration>,
     dynamic_filter_remote_producer_ids: Vec<u64>,
+    remote_join_dynamic_filter_ids: Vec<u64>,
 }
 
 /// Metrics that measure network details about communications between [DistributedExec] and a worker.

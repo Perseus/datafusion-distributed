@@ -41,6 +41,15 @@ extensions_options! {
         /// Control whether dynamic filters are distributed across network boundaries. This does
         /// not control intra-stage filter behavior.
         pub remote_dynamic_filters: bool, default = true
+        /// The longest time, in milliseconds, a task waits before it starts for the dynamic
+        /// filters it gets from hash joins in other tasks. Without a wait, a task can start
+        /// reading before those filters arrive, and then reads data the filters would skip.
+        /// The task starts once every such filter is complete, or when this time passes.
+        ///
+        /// Tasks never wait for TopK or aggregate filters, because those only complete after
+        /// the task has read its data. The wait only happens when `remote_dynamic_filters` is on
+        /// and `dynamic_task_count` is off. Set to 0 (the default) to never wait.
+        pub dynamic_filter_wait_timeout_ms: u64, default = 0
         /// Enable broadcast joins for CollectLeft hash joins. When enabled, the build side of
         /// a CollectLeft join is broadcast to all consumer tasks.
         pub broadcast_joins: bool, default = true

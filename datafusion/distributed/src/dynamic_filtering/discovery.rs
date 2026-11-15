@@ -177,6 +177,56 @@ pub(crate) fn dynamic_filter_remote_producer_ids(
     Ok(remote_producer_ids)
 }
 
+/// Returns the IDs of the dynamic filters that hash joins produce in worker stages.
+///
+/// It only looks inside the stages below `plan`'s network boundaries. The coordinator only
+/// forwards filters that worker tasks produce, so it leaves out joins in the head stage.
+pub(crate) fn worker_join_dynamic_filter_ids(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<HashSet<u64>> {
+    let mut ids = HashSet::new();
+    plan.apply(|node| {
+        if !node.is_network_boundary() {
+            return Ok(TreeNodeRecursion::Continue);
+        }
+        for stage_plan in node.children() {
+            stage_plan.apply(|node| {
+                if node.is::<HashJoinExec>() {
+                    for expression in node.dynamic_expressions_produced() {
+                        if expression.is::<DynamicFilterPhysicalExpr>()
+                            && let Some(id) = expression.expression_id()
+                        {
+                            ids.insert(id);
+                        }
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        // The walk above already covered this stage and every stage below it.
+        Ok(TreeNodeRecursion::Jump)
+    })?;
+    Ok(ids)
+}
+
+/// Returns the IDs of the dynamic filters that `plan` consumes and that a hash join in another
+/// task produces. `worker_join_ids` comes from [`worker_join_dynamic_filter_ids`].
+pub(crate) fn remote_join_dynamic_filter_ids(
+    plan: &Arc<dyn ExecutionPlan>,
+    worker_join_ids: &HashSet<u64>,
+) -> Result<Vec<u64>> {
+    let produced_here: HashSet<_> = discover_dynamic_filter_producers(plan)?
+        .into_iter()
+        .map(|producer| producer.id)
+        .collect();
+    Ok(discover_dynamic_filter_consumers(plan)?
+        .consumers
+        .into_iter()
+        .map(|consumer| consumer.id)
+        .filter(|id| worker_join_ids.contains(id) && !produced_here.contains(id))
+        .collect())
+}
+
 /// Finds consumers whose producer does not occur in `plan`. These consumers become orphaned
 /// from their producer when the producer is moved behind a remote network boundary. These
 /// orphans become network boundary anchors, artificially keeping the producers alive.
@@ -256,7 +306,7 @@ mod tests {
               NetworkShuffleExec
               AggregateExec
                 NetworkShuffleExec anchors=[1]
-        Stage 4
+        Stage 4 remote_join_filters=[1]
           RepartitionExec
             AggregateExec
               DataSourceExec consumers=[1]
@@ -266,7 +316,7 @@ mod tests {
               NetworkShuffleExec
               AggregateExec
                 NetworkShuffleExec anchors=[2]
-        Stage 2
+        Stage 2 remote_join_filters=[2]
           RepartitionExec
             AggregateExec
               DataSourceExec consumers=[2]
@@ -315,7 +365,7 @@ mod tests {
               ProjectionExec
                 AggregateExec
                   NetworkShuffleExec anchors=[1]
-        Stage 2
+        Stage 2 remote_join_filters=[1]
           RepartitionExec
             AggregateExec
               DataSourceExec consumers=[1]
@@ -377,6 +427,35 @@ mod tests {
         Ok(())
     }
 
+    /// A TopK filter only completes after the scan has read its data, so tasks don't wait for it.
+    #[tokio::test]
+    async fn leaves_out_topk_filters_from_remote_join_filters() -> Result<()> {
+        let display = display_query(
+            r#"
+                SELECT key
+                FROM (
+                    SELECT DISTINCT "MinTemp" AS key
+                    FROM weather
+                )
+                ORDER BY key DESC
+                LIMIT 10
+            "#,
+            true,
+        )
+        .await?;
+        assert_snapshot!(display, @"
+        Stage 2 remote_producers=[1]
+          SortExec(TopK) producers=[1]
+            AggregateExec
+              NetworkShuffleExec anchors=[1]
+        Stage 1
+          RepartitionExec
+            AggregateExec
+              DataSourceExec consumers=[1]
+        ");
+        Ok(())
+    }
+
     async fn display_query(sql: &str, remote_dynamic_filters: bool) -> Result<String> {
         let captured_plans = CapturePlans::default();
         let (ctx, _guard, _) = start_localhost_context(2, DefaultSessionBuilder).await;
@@ -393,9 +472,15 @@ mod tests {
         }
         register_parquet_tables(&ctx).await?;
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        // Like the coordinator, only look for join filters when they can reach other tasks.
+        let worker_join_ids = if remote_dynamic_filters {
+            worker_join_dynamic_filter_ids(&plan)?
+        } else {
+            HashSet::new()
+        };
         collect(plan, ctx.task_ctx()).await?;
         let captured_plans = captured_plans.0.lock().await;
-        display_dynamic_filter_discovery(&captured_plans)
+        display_dynamic_filter_discovery(&captured_plans, &worker_join_ids)
     }
 
     /// Captures the first task of each stage for displaying purposes.
@@ -497,6 +582,7 @@ mod tests {
 
     fn display_dynamic_filter_discovery(
         plans: &HashMap<usize, Arc<dyn ExecutionPlan>>,
+        worker_join_ids: &HashSet<u64>,
     ) -> Result<String> {
         fn render(
             node: &dyn ExecutionPlan,
@@ -529,8 +615,17 @@ mod tests {
             let remote_producers = normalizer
                 .annotation("remote_producers", remote_producers)
                 .map_or_else(String::new, |annotation| format!(" {annotation}"));
-            writeln!(output, "Stage {stage_id}{remote_producers}")
-                .expect("writing to String cannot fail");
+            let remote_join_filters = remote_join_dynamic_filter_ids(plan, worker_join_ids)?
+                .into_iter()
+                .collect();
+            let remote_join_filters = normalizer
+                .annotation("remote_join_filters", remote_join_filters)
+                .map_or_else(String::new, |annotation| format!(" {annotation}"));
+            writeln!(
+                output,
+                "Stage {stage_id}{remote_producers}{remote_join_filters}"
+            )
+            .expect("writing to String cannot fail");
             let consumers = discover_dynamic_filter_consumers(plan)?;
             let discovered = DynamicFilterIds {
                 consumers: consumers
