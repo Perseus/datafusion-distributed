@@ -470,6 +470,23 @@ pub trait DistributedExt: Sized {
         batch_size: usize,
     ) -> Result<(), DataFusionError>;
 
+    /// Sets the longest time, in milliseconds, a task waits before it starts for the dynamic
+    /// filters it gets from hash joins in other tasks. See
+    /// [DistributedConfig::dynamic_filter_wait_timeout_ms].
+    ///
+    /// Set to 0 (the default) to never wait.
+    fn with_distributed_dynamic_filter_wait_timeout_ms(
+        self,
+        timeout_ms: u64,
+    ) -> Result<Self, DataFusionError>;
+
+    /// Same as [DistributedExt::with_distributed_dynamic_filter_wait_timeout_ms] but with an
+    /// in-place mutation.
+    fn set_distributed_dynamic_filter_wait_timeout_ms(
+        &mut self,
+        timeout_ms: u64,
+    ) -> Result<(), DataFusionError>;
+
     /// Sets arbitrary HTTP headers that will be forwarded unchanged to worker nodes.
     /// These headers are included in outgoing Arrow Flight requests to workers.
     ///
@@ -902,6 +919,15 @@ impl DistributedExt for SessionConfig {
         Ok(())
     }
 
+    fn set_distributed_dynamic_filter_wait_timeout_ms(
+        &mut self,
+        timeout_ms: u64,
+    ) -> Result<(), DataFusionError> {
+        let d_cfg = DistributedConfig::from_config_options_mut(self.options_mut())?;
+        d_cfg.dynamic_filter_wait_timeout_ms = timeout_ms;
+        Ok(())
+    }
+
     fn set_distributed_passthrough_headers(
         &mut self,
         headers: HeaderMap,
@@ -1052,6 +1078,10 @@ impl DistributedExt for SessionConfig {
             #[expr($?;Ok(self))]
             fn with_distributed_shuffle_batch_size(mut self, batch_size: usize) -> Result<Self, DataFusionError>;
 
+            #[call(set_distributed_dynamic_filter_wait_timeout_ms)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_dynamic_filter_wait_timeout_ms(mut self, timeout_ms: u64) -> Result<Self, DataFusionError>;
+
             #[call(set_distributed_passthrough_headers)]
             #[expr($?;Ok(self))]
             fn with_distributed_passthrough_headers(mut self, headers: HeaderMap) -> Result<Self, DataFusionError>;
@@ -1196,6 +1226,11 @@ impl DistributedExt for SessionStateBuilder {
             #[call(set_distributed_shuffle_batch_size)]
             #[expr($?;Ok(self))]
             fn with_distributed_shuffle_batch_size(mut self, batch_size: usize) -> Result<Self, DataFusionError>;
+
+            fn set_distributed_dynamic_filter_wait_timeout_ms(&mut self, timeout_ms: u64) -> Result<(), DataFusionError>;
+            #[call(set_distributed_dynamic_filter_wait_timeout_ms)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_dynamic_filter_wait_timeout_ms(mut self, timeout_ms: u64) -> Result<Self, DataFusionError>;
 
             fn set_distributed_passthrough_headers(&mut self, headers: HeaderMap) -> Result<(), DataFusionError>;
             #[call(set_distributed_passthrough_headers)]
@@ -1362,6 +1397,11 @@ impl DistributedExt for SessionState {
             #[expr($?;Ok(self))]
             fn with_distributed_shuffle_batch_size(mut self, batch_size: usize) -> Result<Self, DataFusionError>;
 
+            fn set_distributed_dynamic_filter_wait_timeout_ms(&mut self, timeout_ms: u64) -> Result<(), DataFusionError>;
+            #[call(set_distributed_dynamic_filter_wait_timeout_ms)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_dynamic_filter_wait_timeout_ms(mut self, timeout_ms: u64) -> Result<Self, DataFusionError>;
+
             fn set_distributed_passthrough_headers(&mut self, headers: HeaderMap) -> Result<(), DataFusionError>;
             #[call(set_distributed_passthrough_headers)]
             #[expr($?;Ok(self))]
@@ -1519,6 +1559,11 @@ impl DistributedExt for SessionContext {
             #[call(set_distributed_shuffle_batch_size)]
             #[expr($?;Ok(self))]
             fn with_distributed_shuffle_batch_size(self, batch_size: usize) -> Result<Self, DataFusionError>;
+
+            fn set_distributed_dynamic_filter_wait_timeout_ms(&mut self, timeout_ms: u64) -> Result<(), DataFusionError>;
+            #[call(set_distributed_dynamic_filter_wait_timeout_ms)]
+            #[expr($?;Ok(self))]
+            fn with_distributed_dynamic_filter_wait_timeout_ms(self, timeout_ms: u64) -> Result<Self, DataFusionError>;
 
             fn set_distributed_passthrough_headers(&mut self, headers: HeaderMap) -> Result<(), DataFusionError>;
             #[call(set_distributed_passthrough_headers)]
