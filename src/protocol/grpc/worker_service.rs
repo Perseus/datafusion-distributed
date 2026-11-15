@@ -119,17 +119,32 @@ impl pb::worker_service_server::WorkerService for Worker {
             })
             .boxed();
 
-        let CoordinatorChannelResult { task_ctx, stream } = self
-            .coordinator_channel(metadata.into_headers(), set_plan_request, input_stream)
-            .await
-            .map_err(datafusion_error_to_tonic_status)?;
-
-        let output_stream = stream
-            .map(move |msg| match msg {
-                Ok(msg) => encode_worker_to_coordinator_msg(msg, &task_ctx),
-                Err(err) => Err(datafusion_error_to_tonic_status(err)),
-            })
-            .boxed();
+        // Reply before the task is set up. Setting it up decodes the plan, which can take tens
+        // of milliseconds for large plans. The coordinator waits for this reply before it sends
+        // the plans of the stages that read from this one, so replying early lets every stage
+        // be set up at the same time instead of one level after another. A setup error is sent
+        // as the first item of the stream, and `execute_task` waits until setup has finished.
+        let worker = self.clone();
+        let headers = metadata.into_headers();
+        let output_stream = futures::stream::once(async move {
+            match worker
+                .coordinator_channel(headers, set_plan_request, input_stream)
+                .await
+            {
+                Ok(CoordinatorChannelResult { task_ctx, stream }) => stream
+                    .map(move |msg| match msg {
+                        Ok(msg) => encode_worker_to_coordinator_msg(msg, &task_ctx),
+                        Err(err) => Err(datafusion_error_to_tonic_status(err)),
+                    })
+                    .boxed(),
+                Err(err) => {
+                    futures::stream::once(async move { Err(datafusion_error_to_tonic_status(err)) })
+                        .boxed()
+                }
+            }
+        })
+        .flatten()
+        .boxed();
 
         Ok(Response::new(output_stream))
     }

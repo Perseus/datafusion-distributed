@@ -94,6 +94,27 @@ mod tests {
         Ok(())
     }
 
+    #[test_case(false; "static_planner")]
+    #[test_case(true; "adaptive_planner")]
+    #[tokio::test]
+    async fn worker_setup_error_fails_query(adaptive: bool) -> Result<(), Box<dyn Error>> {
+        async fn failing_state(_: WorkerQueryContext) -> Result<SessionState, DataFusionError> {
+            exec_err!("injected worker setup error")
+        }
+
+        let (ctx, _guard, _) = start_localhost_context(2, failing_state).await;
+        let ctx = ctx.with_distributed_dynamic_task_count(adaptive)?;
+        register_parquet_tables(&ctx).await?;
+        let query = ctx
+            .sql(r#"SELECT "MinTemp" FROM weather WHERE "MinTemp" > 20.0"#)
+            .await?;
+        let error = timeout(Duration::from_secs(5), query.collect())
+            .await?
+            .expect_err("worker setup error must fail the query");
+        assert_contains!(error.to_string(), "injected worker setup error");
+        Ok(())
+    }
+
     struct FailingWorkerChannel;
 
     #[async_trait]
