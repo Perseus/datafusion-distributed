@@ -99,7 +99,7 @@ pub async fn rewrite_distributed_plan_with_metrics(
 /// Gathers metrics that belong to a task as a whole rather than to an execution-plan node.
 fn stage_metrics(
     stage: &LocalStage,
-    metrics_collection: &HashMap<TaskKey, TaskMetrics>,
+    metrics_collection: &HashMap<TaskKey, Arc<TaskMetrics>>,
 ) -> Result<MetricsSet> {
     let mut all_metrics = stage.metrics_set.clone();
     for task_number in 0..stage.tasks {
@@ -237,7 +237,7 @@ pub fn rewrite_local_plan_with_metrics(
 /// Note: Metrics may be aggregated by name (ex. output_rows) automatically by various datafusion utils.
 pub fn stage_metrics_rewriter(
     stage: &LocalStage,
-    metrics_collection: &HashMap<TaskKey, TaskMetrics>,
+    metrics_collection: &HashMap<TaskKey, Arc<TaskMetrics>>,
     format: DistributedMetricsFormat,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     // Phase 1 — accumulate per-task metrics into a map keyed by node identity.
@@ -498,7 +498,7 @@ mod tests {
                 task_metrics: MetricsSet::new(),
                 pre_order_plan_metrics: metrics,
             };
-            (task_key, task_metrics)
+            (task_key, Arc::new(task_metrics))
         }));
         // Rewrite the plan.
         let rewritten_plan = stage_metrics_rewriter(&stage, &metrics_collection, format).unwrap();

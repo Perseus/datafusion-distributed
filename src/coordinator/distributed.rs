@@ -91,7 +91,7 @@ impl DistributedExec {
 
     /// Waits until all worker tasks have reported their metrics back via the coordinator channel
     /// if metrics collection is enabled.
-    pub async fn wait_for_metrics(&self) -> Option<HashMap<TaskKey, TaskMetrics>> {
+    pub async fn wait_for_metrics(&self) -> Option<HashMap<TaskKey, Arc<TaskMetrics>>> {
         let task_metrics = self.metrics_store.as_ref()?;
         let plan = &self.prepared_plan.get()?.plan_for_viz;
         Some(task_metrics.wait_for(&task_keys_for_plan(plan)).await)
@@ -101,7 +101,7 @@ impl DistributedExec {
     /// the coordinator channel if dynamic filter collection is enabled.
     pub(crate) async fn wait_for_dynamic_filters(
         &self,
-    ) -> Option<HashMap<TaskKey, TaskCompletedDynamicFilters>> {
+    ) -> Option<HashMap<TaskKey, Arc<TaskCompletedDynamicFilters>>> {
         let store = self.completed_dynamic_filter_store.as_ref()?;
         let plan = &self.prepared_plan.get()?.plan_for_viz;
         Some(store.wait_for(&task_keys_for_plan(plan)).await)

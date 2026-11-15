@@ -6,7 +6,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-type StoreMap<T> = HashMap<TaskKey, T>;
+/// Values are reference counted so that waiters share them. A task's metrics hold every metric of
+/// every plan node, so copying them for each waiter is slow on large plans.
+type StoreMap<T> = HashMap<TaskKey, Arc<T>>;
 
 /// Stores task-scoped values and notifies waiters when entries change.
 #[derive(Debug, Clone)]
@@ -23,14 +25,11 @@ impl<T> Store<T> {
 
     pub(crate) fn insert(&self, key: TaskKey, value: T) {
         self.tx.send_modify(|map| {
-            map.insert(key, value);
+            map.insert(key, Arc::new(value));
         });
     }
 
-    pub(crate) async fn wait_for(&self, expected_keys: &[TaskKey]) -> StoreMap<T>
-    where
-        T: Clone,
-    {
+    pub(crate) async fn wait_for(&self, expected_keys: &[TaskKey]) -> StoreMap<T> {
         let mut rx = self.rx.clone();
         if !expected_keys.is_empty() {
             let _ = rx
