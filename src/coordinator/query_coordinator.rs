@@ -475,16 +475,28 @@ impl<'a> StageCoordinator<'a> {
     /// Each task gets its own copy of the plan, and encoding a plan with many file scans takes
     /// tens of milliseconds. Doing it one task at a time on the coordinator delays the start of
     /// the last task by the sum of all of them.
-    pub(super) fn prepare_tasks(&self) -> Result<Vec<PreparedTask>> {
-        let (plan, task_ctx, task_count) = (self.plan, self.task_ctx, self.task_count);
-        run_in_parallel(task_count, |task_i| {
-            let specialized = task_specialized_plan(plan, task_ctx, task_count, task_i)?;
-            let encoded_plan = encode_execution_plan(Arc::clone(&specialized.plan), task_ctx)?;
-            Ok(PreparedTask {
-                specialized,
-                encoded_plan,
+    ///
+    /// The work runs on a blocking thread. All stages of a query are set up from one task, so
+    /// doing this work on that task would also make sibling stages wait for each other.
+    pub(super) async fn prepare_tasks(&self) -> Result<Vec<PreparedTask>> {
+        let (plan, task_ctx) = (Arc::clone(self.plan), Arc::clone(self.task_ctx));
+        let task_count = self.task_count;
+        let prepare = move || {
+            run_in_parallel(task_count, |task_i| {
+                let specialized = task_specialized_plan(&plan, &task_ctx, task_count, task_i)?;
+                let encoded_plan = encode_execution_plan(Arc::clone(&specialized.plan), &task_ctx)?;
+                Ok(PreparedTask {
+                    specialized,
+                    encoded_plan,
+                })
             })
-        })
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.spawn_blocking(prepare).await.unwrap_or_else(|err| {
+                internal_err!("a thread preparing distributed tasks failed: {err}")
+            }),
+            Err(_) => prepare(),
+        }
     }
 }
 
@@ -497,41 +509,32 @@ fn run_in_parallel<T: Send>(count: usize, f: impl Fn(usize) -> Result<T> + Sync)
     if threads <= 1 {
         return (0..count).map(f).collect();
     }
-    let run = || {
-        std::thread::scope(|scope| {
-            let f = &f;
-            let workers = (0..threads)
-                .map(|t| {
-                    scope.spawn(move || {
-                        (t..count)
-                            .step_by(threads)
-                            .map(|i| (i, f(i)))
-                            .collect::<Vec<_>>()
-                    })
+    std::thread::scope(|scope| {
+        let f = &f;
+        let workers = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    (t..count)
+                        .step_by(threads)
+                        .map(|i| (i, f(i)))
+                        .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>();
-            let mut results = (0..count).map(|_| None).collect::<Vec<_>>();
-            for worker in workers {
-                let Ok(done) = worker.join() else {
-                    return internal_err!("a thread preparing distributed tasks panicked");
-                };
-                for (i, result) in done {
-                    results[i] = Some(result);
-                }
+            })
+            .collect::<Vec<_>>();
+        let mut results = (0..count).map(|_| None).collect::<Vec<_>>();
+        for worker in workers {
+            let Ok(done) = worker.join() else {
+                return internal_err!("a thread preparing distributed tasks panicked");
+            };
+            for (i, result) in done {
+                results[i] = Some(result);
             }
-            results
-                .into_iter()
-                .map(|r| r.unwrap_or_else(|| internal_err!("distributed task was not prepared")))
-                .collect()
-        })
-    };
-    // Lets the runtime move other tasks off this thread while it waits for the work.
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(run)
         }
-        _ => run(),
-    }
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| internal_err!("distributed task was not prepared")))
+            .collect()
+    })
 }
 
 /// A task's specialized plan, with the same plan already encoded for remote workers.
