@@ -160,6 +160,9 @@ message SetPlanRequest {
   uint64 query_start_time_ns = 6;
   // Producer IDs whose updates must be reported to the coordinator for remote consumers.
   repeated uint64 dynamic_filter_remote_producer_ids = 8;
+  // IDs of the dynamic filters this task consumes that a hash join in another task produces. The
+  // task waits for them before it starts. Empty when tasks don't wait.
+  repeated uint64 remote_join_dynamic_filter_ids = 9;
 }
 
 message WorkUnitBatch {

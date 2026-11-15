@@ -4,12 +4,13 @@ use crate::coordinator::prepare_static_plan::prepare_static_plan;
 use crate::coordinator::query_coordinator::QueryCoordinator;
 use crate::coordinator::store::{Store, task_keys_for_plan};
 use crate::dynamic_filtering::{
-    is_local_dynamic_filtering_enabled, sever_dynamic_filter_relationships_in_plan_for_display,
+    is_local_dynamic_filtering_enabled, is_remote_dynamic_filtering_enabled,
+    sever_dynamic_filter_relationships_in_plan_for_display, worker_join_dynamic_filter_ids,
 };
 use crate::{DistributedConfig, TaskCompletedDynamicFilters, TaskKey, TaskMetrics};
 use datafusion::common::internal_datafusion_err;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{HashMap, Result, exec_err};
+use datafusion::common::{HashMap, HashSet, Result, exec_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr_common::metrics::MetricsSet;
@@ -222,6 +223,19 @@ impl ExecutionPlan for DistributedExec {
         let prepared_plan = Arc::clone(&self.prepared_plan);
         let collect_dynamic_filters = self.completed_dynamic_filter_store.is_some();
 
+        // Tasks only wait for join filters with static task counts. With dynamic task counts, the
+        // coordinator sends a join's stage to workers only after the stages below it have started
+        // reading, so a wait would only add time.
+        let d_cfg = DistributedConfig::from_config_options(context.session_config().options())?;
+        let worker_join_dynamic_filter_ids = if d_cfg.dynamic_filter_wait_timeout_ms > 0
+            && !d_cfg.dynamic_task_count
+            && is_remote_dynamic_filtering_enabled(context.session_config())?
+        {
+            worker_join_dynamic_filter_ids(&base_plan)?
+        } else {
+            HashSet::new()
+        };
+
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.schema(), 1);
         let tx = builder.tx();
         let query_coordinator = Arc::new(QueryCoordinator::new(
@@ -229,6 +243,7 @@ impl ExecutionPlan for DistributedExec {
             &self.metrics,
             self.metrics_store.clone(),
             self.completed_dynamic_filter_store.clone(),
+            worker_join_dynamic_filter_ids,
             &mut builder,
         ));
         // Capture the guard before spawning so even an unpolled execution future cancels on drop.

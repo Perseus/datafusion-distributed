@@ -4,3 +4,4 @@ mod common;
 mod config;
 mod partitioned_join;
 mod sorts;
+mod wait_timeout;

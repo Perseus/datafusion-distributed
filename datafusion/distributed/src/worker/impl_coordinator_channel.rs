@@ -10,6 +10,7 @@ use crate::execution_plans::SamplerExec;
 use crate::metrics::aggregate_by_name;
 use crate::protocol::LocalWorkerContext;
 use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
+use crate::worker::dynamic_filter_wait::DynamicFilterWait;
 use crate::worker::task_data::TaskDataMetrics;
 use crate::{
     CoordinatorToWorkerMsg, DistributedConfig, DistributedExt, DistributedTaskContext,
@@ -31,6 +32,7 @@ use http::HeaderMap;
 #[cfg(feature = "integration")]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::sync::{oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -85,6 +87,8 @@ impl Worker {
             let shuffle_batch_size = d_cfg.shuffle_batch_size;
             let collect_metrics = d_cfg.collect_metrics;
             let collect_dynamic_filters = d_cfg.collect_dynamic_filters;
+            let dynamic_filter_wait_timeout =
+                Duration::from_millis(d_cfg.dynamic_filter_wait_timeout_ms);
             if shuffle_batch_size != 0 {
                 cfg = cfg.with_batch_size(shuffle_batch_size);
             }
@@ -108,6 +112,11 @@ impl Worker {
                 session_config: session_state.config(),
             };
             let plan = WorkerPlanRewriteHandlers::handle(ev).await?.plan;
+            let dynamic_filter_wait = DynamicFilterWait::try_new(
+                &plan,
+                &request.remote_join_dynamic_filter_ids,
+                dynamic_filter_wait_timeout,
+            )?;
 
             // Initialize partition count to the number of partitions in the stage
             Ok::<_, DataFusionError>(TaskData {
@@ -124,6 +133,7 @@ impl Worker {
                 },
                 task_data_metrics: Arc::new(TaskDataMetrics::new(request.query_start_time_ns)),
                 outcome_tracker: Default::default(),
+                dynamic_filter_wait,
             })
         };
 
@@ -467,6 +477,7 @@ mod tests {
                 Schema::empty(),
             )))),
             dynamic_filter_remote_producer_ids: vec![],
+            remote_join_dynamic_filter_ids: vec![],
             work_unit_feed_declarations: vec![],
             target_worker_url: Url::parse("http://worker.test").unwrap(),
             query_start_time_ns: 0,

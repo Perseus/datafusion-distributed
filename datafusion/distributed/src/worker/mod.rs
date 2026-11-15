@@ -1,3 +1,4 @@
+mod dynamic_filter_wait;
 mod impl_coordinator_channel;
 mod impl_execute_task;
 mod session_builder;
