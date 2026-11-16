@@ -1,23 +1,26 @@
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::HashMap;
 use datafusion::physical_expr::{PhysicalExpr, conjunction};
 use datafusion::physical_expr_common::physical_expr::{
     snapshot_generation, snapshot_physical_expr,
 };
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use datafusion::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricType, PruningMetrics,
 };
 use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
 
+use crate::common::dynamic_filters::file_bounds::FileBounds;
 use crate::common::dynamic_filters::partition_filter::PartitionFilter;
 use crate::common::dynamic_filters::physical_predicate::convert_physical_filter_to_predicate;
 use crate::common::dynamic_filters::row_group_filter::with_dynamic_filter;
 
 /// Applies the scan's dynamic filters to each file just before the reader opens it. It skips
-/// files whose partition value can't match the filters. For the other files, it can add the
-/// filters to the file's own filter, so the reader can skip row groups.
+/// files whose partition value or column bounds can't match the filters. For the other files, it
+/// can add the filters to the file's own filter, so the reader can skip row groups.
 pub(crate) struct DynamicFilterPruner {
     /// The scan's dynamic filters, combined with AND.
     dynamic_filters: Arc<dyn PhysicalExpr>,
@@ -32,13 +35,24 @@ pub(crate) struct DynamicFilterPruner {
     /// A map of partition spec IDs to their corresponding partition filter executors
     partition_filters: HashMap<i32, Option<PartitionFilter>>,
 
+    /// The scan's output schema, which the filters' columns refer to.
+    schema: SchemaRef,
+
+    /// The filters as a predicate over file column bounds. `None` if the bounds can't rule
+    /// anything out.
+    bounds_predicate: Option<Arc<PruningPredicate>>,
+
     /// Metrics to track pruning
     files: PruningMetrics,
+
+    /// Files that passed the partition check, pruned or matched by their column bounds.
+    files_by_bounds: PruningMetrics,
 }
 
 impl DynamicFilterPruner {
     pub(crate) fn new(
         dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
+        schema: SchemaRef,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Self {
@@ -47,20 +61,34 @@ impl DynamicFilterPruner {
             cached_snapshot_generation: 0,
             predicate: None,
             partition_filters: HashMap::new(),
+            schema,
+            bounds_predicate: None,
             files: MetricBuilder::new(metrics)
                 .with_type(MetricType::Summary)
                 .pruning_metrics("files_pruned_by_partition", partition),
+            files_by_bounds: MetricBuilder::new(metrics)
+                .with_type(MetricType::Summary)
+                .pruning_metrics("files_pruned_by_bounds", partition),
         }
     }
 
     /// Whether the filters rule out every row in the task's partition. Counts the task as pruned
     /// or matched
     pub(crate) fn should_prune(&mut self, task: &FileScanTask) -> bool {
-        let prune = self.can_skip(task);
-        if prune {
+        if self.can_skip(task) {
             self.files.add_pruned(1);
+            return true;
+        }
+        self.files.add_matched(1);
+        let schema = Arc::clone(&self.schema);
+        let Some(bounds) = FileBounds::new(&schema, task) else {
+            return false;
+        };
+        let prune = self.bounds_rule_out(&bounds);
+        if prune {
+            self.files_by_bounds.add_pruned(1);
         } else {
-            self.files.add_matched(1);
+            self.files_by_bounds.add_matched(1);
         }
         prune
     }
@@ -122,7 +150,19 @@ impl DynamicFilterPruner {
         filter.can_match(partition).is_ok_and(|matches| !matches)
     }
 
-    /// Rebuilds the predicate when any of the filters has changed.
+    /// Whether no value within the file's column bounds can match the filters.
+    fn bounds_rule_out(&mut self, bounds: &FileBounds) -> bool {
+        self.refresh();
+        let Some(predicate) = &self.bounds_predicate else {
+            return false;
+        };
+        // On an error, the file is read.
+        predicate
+            .prune(bounds)
+            .is_ok_and(|keep| keep.iter().all(|keep| !keep))
+    }
+
+    /// Rebuilds the predicates when any of the filters has changed.
     fn refresh(&mut self) {
         // Read the current generation before snapshotting the filters.
         // The two reads aren't atomic, so a filter can change between them.
@@ -138,8 +178,14 @@ impl DynamicFilterPruner {
         }
         self.cached_snapshot_generation = generation;
         self.partition_filters.clear();
-        self.predicate = snapshot_physical_expr(Arc::clone(&self.dynamic_filters))
-            .ok()
-            .and_then(|snapshot| convert_physical_filter_to_predicate(&snapshot));
+        let snapshot = snapshot_physical_expr(Arc::clone(&self.dynamic_filters)).ok();
+        self.predicate = snapshot
+            .as_ref()
+            .and_then(convert_physical_filter_to_predicate);
+        self.bounds_predicate = snapshot.and_then(|snapshot| {
+            PruningPredicateBuilder::new()
+                .with_file_schema(Arc::clone(&self.schema))
+                .build(snapshot)
+        });
     }
 }

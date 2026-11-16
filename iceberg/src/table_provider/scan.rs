@@ -136,8 +136,11 @@ pub(crate) async fn plan_scan(
         None
     };
     if let Some(mut planned) = planned {
-        // The metrics are summarized above; keep them off the tasks sent to workers.
-        planned.drop_column_stats();
+        // The metrics are summarized above. Workers only use them to skip files with dynamic
+        // filters, so otherwise keep them off the tasks sent to workers.
+        if !IcebergConfig::from_task_context(&context).dynamic_filtering_enabled {
+            planned.drop_column_stats();
+        }
         let planned = Arc::new(planned);
         let mut statistics = planned.statistics(&scan.schema, may_filter_rows);
         if let Some(column_stats) = column_stats {
