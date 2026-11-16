@@ -157,11 +157,15 @@ impl ScanConfig {
 
         let mut pruner = self.dynamic_filter_pruner(partition);
         let reader_uses_dynamic_filters = self.reader_uses_dynamic_filters;
+        let dbg_scan = Arc::as_ptr(&self.schema) as *const u8 as usize % 100_000;
+        eprintln!("DFDBG {} scan_part_open scan={} partition={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), dbg_scan, partition);
         // The reader pulls a task when it starts reading that task's file. It reads ahead,
         // so with a LIMIT this can count files that never produced output. Skipped files
         // are dropped before this, and the pruner counts them.
         let tasks = tasks
             .try_filter_map(move |task| {
+                eprintln!("DFDBG {} file_pull scan={} partition={} file={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), dbg_scan, partition,
+                    task.data_file_path().rsplit('/').next().unwrap_or(""));
                 let Some(pruner) = pruner.as_mut() else {
                     return ready(Ok(Some(task)));
                 };
@@ -183,6 +187,9 @@ impl ScanConfig {
             let poll = batches.poll_next_unpin(cx);
             if poll.is_ready() {
                 bytes_scanned.set(reader_metrics.bytes_read() as usize);
+            }
+            if matches!(poll, std::task::Poll::Ready(None)) {
+                eprintln!("DFDBG {} scan_part_done scan={} partition={} bytes={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), dbg_scan, partition, reader_metrics.bytes_read());
             }
             poll
         });
