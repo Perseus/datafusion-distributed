@@ -95,7 +95,9 @@ impl DistributedExec {
     pub async fn wait_for_metrics(&self) -> Option<HashMap<TaskKey, Arc<TaskMetrics>>> {
         let task_metrics = self.metrics_store.as_ref()?;
         let plan = &self.prepared_plan.get()?.plan_for_viz;
-        Some(task_metrics.wait_for(&task_keys_for_plan(plan)).await)
+        let metrics = task_metrics.wait_for(&task_keys_for_plan(plan)).await;
+        eprintln!("DFDBG {} metrics_collected tasks={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), metrics.len());
+        Some(metrics)
     }
 
     /// Waits until all worker tasks have reported their completed dynamic filters back via
@@ -286,6 +288,7 @@ impl ExecutionPlan for DistributedExec {
                     break; // channel closed
                 }
             }
+            eprintln!("DFDBG {} head_done partition={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), partition);
             Ok(())
         });
 

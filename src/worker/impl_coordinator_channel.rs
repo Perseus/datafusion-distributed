@@ -249,6 +249,7 @@ impl Worker {
             // It's expected that dynamic filters should complete and send their updates before
             // task execution ends.
             producer_cancel_tx.send_replace(true);
+            eprintln!("DFDBG {} task_closed stage={} task={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), key.stage_id, key.task_number);
 
             // Send metrics and completed dynamic filters if enabled.
 
@@ -267,6 +268,7 @@ impl Worker {
                 task_data_metrics.mark_execution_finished();
                 if let Some(metrics_tx) = metrics_tx {
                     send_metrics_via_channel(metrics_tx, plan, d_ctx, task_data_metrics);
+                    eprintln!("DFDBG {} metrics_sent stage={} task={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), key.stage_id, key.task_number);
                 }
                 if let Some(dynamic_filters_tx) = dynamic_filters_tx {
                     // TODO(#686): handle error

@@ -74,6 +74,23 @@ impl Worker {
                 }
             };
             let stream_schema = plan.schema();
+            let (dbg_stage, dbg_task) = (request.task_key.stage_id, request.task_key.task_number);
+            let dbg_rows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dbg_rows_in = Arc::clone(&dbg_rows);
+            let stream = futures::StreamExt::chain(
+                futures::StreamExt::inspect(stream, move |batch| {
+                    if let Ok(batch) = batch {
+                        dbg_rows_in.fetch_add(batch.num_rows(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }),
+                futures::StreamExt::filter_map(stream::once(async move {
+                    eprintln!(
+                        "DFDBG {} partition_done stage={} task={} partition={} rows={}",
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), dbg_stage, dbg_task, partition,
+                        dbg_rows.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                }), |_| async { None }),
+            );
 
             streams.push(Box::pin(RecordBatchStreamAdapter::new(stream_schema, stream)) as _);
         }
