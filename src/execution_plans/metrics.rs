@@ -1,4 +1,5 @@
-use datafusion::physical_plan::metrics::MetricsSet;
+use crate::DISTRIBUTED_DATAFUSION_TASK_ID_LABEL;
+use datafusion::physical_plan::metrics::{Label, Metric, MetricsSet};
 use std::sync::Arc;
 
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -115,9 +116,12 @@ impl ExecutionPlan for MetricsWrapperExec {
                     // 1. What was collected in the local worker
                     // 2. What is automatically available in the coordinator because of pointer
                     //    equivalence.
+                    //
+                    // Workers sum each metric over partitions before reporting it, so a reported
+                    // metric covers every local metric with the same name and labels.
                     if !self.metrics.iter().any(|wrapped| {
-                        wrapped.value() == local_metric.value()
-                            && wrapped.partition() == local_metric.partition()
+                        wrapped.value().name() == local_metric.value().name()
+                            && same_labels_ignoring_task_id(wrapped, &local_metric)
                     }) {
                         all_metrics.push(local_metric);
                     }
@@ -130,6 +134,16 @@ impl ExecutionPlan for MetricsWrapperExec {
     fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
         Some(self.inner.as_ref())
     }
+}
+
+/// Whether `a` and `b` have the same labels, leaving out the task id that the coordinator adds to
+/// reported metrics.
+fn same_labels_ignoring_task_id(a: &Metric, b: &Metric) -> bool {
+    let not_task_id = |label: &&Label| label.name() != DISTRIBUTED_DATAFUSION_TASK_ID_LABEL;
+    a.labels()
+        .iter()
+        .filter(not_task_id)
+        .eq(b.labels().iter().filter(not_task_id))
 }
 
 #[cfg(test)]

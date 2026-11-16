@@ -24,6 +24,7 @@ use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::metrics::{Label, Metric, MetricsSet};
 use datafusion::prelude::SessionConfig;
 use futures::stream::{BoxStream, FuturesUnordered, select_all};
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -249,7 +250,15 @@ impl Worker {
             // It's expected that dynamic filters should complete and send their updates before
             // task execution ends.
             producer_cancel_tx.send_replace(true);
-            eprintln!("DFDBG {} task_closed stage={} task={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), key.stage_id, key.task_number);
+            eprintln!(
+                "DFDBG {} task_closed stage={} task={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                key.stage_id,
+                key.task_number
+            );
 
             // Send metrics and completed dynamic filters if enabled.
 
@@ -268,7 +277,15 @@ impl Worker {
                 task_data_metrics.mark_execution_finished();
                 if let Some(metrics_tx) = metrics_tx {
                     send_metrics_via_channel(metrics_tx, plan, d_ctx, task_data_metrics);
-                    eprintln!("DFDBG {} metrics_sent stage={} task={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), key.stage_id, key.task_number);
+                    eprintln!(
+                        "DFDBG {} metrics_sent stage={} task={}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0),
+                        key.stage_id,
+                        key.task_number
+                    );
                 }
                 if let Some(dynamic_filters_tx) = dynamic_filters_tx {
                     // TODO(#686): handle error
@@ -434,7 +451,7 @@ fn send_metrics_via_channel(
 ) {
     let mut pre_order_plan_metrics = vec![];
     let _ = plan.apply_with_dt_ctx(dt_ctx, |node, _| {
-        pre_order_plan_metrics.push(node.metrics().unwrap_or_default());
+        pre_order_plan_metrics.push(sum_partitions(&node.metrics().unwrap_or_default()));
         Ok(TreeNodeRecursion::Continue)
     });
 
@@ -445,8 +462,87 @@ fn send_metrics_via_channel(
     });
 }
 
+/// Returns `metrics` with the metrics that differ only by partition combined into one.
+///
+/// The coordinator reports a task's metrics summed over its partitions, so the per-partition
+/// values never reach the user. Some operators record a metric per partition, or per pair of
+/// input and output partitions, so a task with many partitions would otherwise send one entry
+/// for each, and the transfer delays the end of the query. Metrics keep their labels, so
+/// metrics that labels tell apart stay apart.
+fn sum_partitions(metrics: &MetricsSet) -> MetricsSet {
+    let mut combined: Vec<Metric> = vec![];
+    let mut index: HashMap<(&str, &[Label]), usize> = HashMap::new();
+    for metric in metrics.iter() {
+        let key = (metric.value().name(), metric.labels());
+        match index.get(&key) {
+            Some(&i) => combined[i].value_mut().aggregate(metric.value()),
+            None => {
+                let mut sum =
+                    Metric::new_with_labels(metric.value().new_empty(), None, key.1.to_vec())
+                        .with_type(metric.metric_type());
+                if let Some(category) = metric.metric_category() {
+                    sum = sum.with_category(category);
+                }
+                sum.value_mut().aggregate(metric.value());
+                index.insert(key, combined.len());
+                combined.push(sum);
+            }
+        }
+    }
+    let mut set = MetricsSet::new();
+    for metric in combined {
+        set.push(Arc::new(metric));
+    }
+    set
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sum_partitions_combines_partitions_and_keeps_labels_apart() {
+        use datafusion::physical_plan::metrics::{Count, MetricValue};
+        let count = |name: &'static str, value: usize, partition, labels: Vec<Label>| {
+            let c = Count::new();
+            c.add(value);
+            Arc::new(Metric::new_with_labels(
+                MetricValue::Count {
+                    name: name.into(),
+                    count: c,
+                },
+                Some(partition),
+                labels,
+            ))
+        };
+        let out = |p: usize| vec![Label::new("outputPartition", p.to_string())];
+        let mut metrics = MetricsSet::new();
+        for input in 0..3 {
+            metrics.push(count("rows", 1, input, vec![]));
+            metrics.push(count("sent", 2, input, out(0)));
+            metrics.push(count("sent", 3, input, out(1)));
+        }
+
+        let summed = sum_partitions(&metrics);
+        let entries: Vec<_> = summed
+            .iter()
+            .map(|m| {
+                (
+                    m.value().name().to_string(),
+                    m.labels().to_vec(),
+                    m.value().as_usize(),
+                    m.partition(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("rows".to_string(), vec![], 3, None),
+                ("sent".to_string(), out(0), 6, None),
+                ("sent".to_string(), out(1), 9, None),
+            ]
+        );
+    }
     use super::*;
     use crate::TaskKey;
     use datafusion::arrow::datatypes::Schema;
