@@ -66,6 +66,11 @@ impl Worker {
         pb::worker_service_server::WorkerServiceServer::new(self)
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX)
+            // Compresses responses only for clients that ask for it. Clients ask only on the
+            // coordinator channel, whose task metrics can be large; task data is already
+            // compressed by Arrow IPC.
+            .send_compressed(tonic::codec::CompressionEncoding::Zstd)
+            .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
     }
 
     /// Creates an [`ObservabilityServiceServer`] that exposes task progress and cluster

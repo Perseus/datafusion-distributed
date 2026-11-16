@@ -79,10 +79,16 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
             }
         }));
 
+        // Ask the worker to compress what it sends back. Task metrics carry one entry per plan
+        // node and metric, with repeated names, so plans with many nodes produce large messages
+        // that compress well. Workers that do not support compression ignore the request.
+        let mut client = self
+            .clone()
+            .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
         let response = tokio::select! {
             biased;
             Some(error) = error_rx.recv() => return Err(error),
-            response = self.coordinator_channel(Request::from_parts(
+            response = client.coordinator_channel(Request::from_parts(
                 MetadataMap::from_headers(headers),
                 Extensions::default(),
                 input_stream,
