@@ -590,7 +590,11 @@ fn decode_worker_to_coordinator_msg(
             .ok_or_else(|| missing("WorkerToCoordinatorMsg.inner"))?
         {
             pb::worker_to_coordinator_msg::Inner::TaskMetrics(task_metrics) => {
-                WorkerToCoordinatorMsg::TaskMetrics(decode_task_metrics(task_metrics)?)
+                let bytes = prost::Message::encoded_len(&task_metrics);
+                let start = std::time::Instant::now();
+                let decoded = decode_task_metrics(task_metrics)?;
+                eprintln!("DFDBG {} metrics_decoded bytes={} decode_us={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), bytes, start.elapsed().as_micros());
+                WorkerToCoordinatorMsg::TaskMetrics(decoded)
             }
             pb::worker_to_coordinator_msg::Inner::LoadInfo(load_info) => {
                 WorkerToCoordinatorMsg::LoadInfo(decode_load_info(load_info))

@@ -377,6 +377,7 @@ impl<'a> StageCoordinator<'a> {
                     FinalReport::Metrics(v) => {
                         if let Some(task_metrics) = task_metrics.take() {
                             task_metrics.insert(task_key, v);
+                            eprintln!("DFDBG {} metrics_stored stage={} task={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), task_key.stage_id, task_key.task_number);
                         }
                     }
                     FinalReport::DynamicFilters(filters) => {

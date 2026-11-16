@@ -303,9 +303,10 @@ fn encode_worker_to_coordinator_msg(
     Ok(pb::WorkerToCoordinatorMsg {
         inner: Some(match msg {
             WorkerToCoordinatorMsg::TaskMetrics(task_metrics) => {
-                pb::worker_to_coordinator_msg::Inner::TaskMetrics(encode_task_metrics(
-                    task_metrics,
-                )?)
+                let start = std::time::Instant::now();
+                let encoded = encode_task_metrics(task_metrics)?;
+                eprintln!("DFDBG {} metrics_encoded bytes={} encode_us={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), encoded.encoded_len(), start.elapsed().as_micros());
+                pb::worker_to_coordinator_msg::Inner::TaskMetrics(encoded)
             }
             WorkerToCoordinatorMsg::LoadInfo(load_info) => {
                 pb::worker_to_coordinator_msg::Inner::LoadInfo(encode_load_info(load_info))
