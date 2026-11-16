@@ -7,6 +7,7 @@ use datafusion::common::{ColumnStatistics, Statistics};
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::{DynamicFilterPhysicalExpr, InListExpr, lit};
+use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::{Partitioning, PhysicalExpr, conjunction, split_conjunction};
 use datafusion::physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion::physical_plan::apply_expression_roots;
@@ -84,6 +85,25 @@ impl ScanConfig {
     /// ANDs `filters` onto the scan's filters.
     pub(crate) fn push_filters(&mut self, filters: Vec<Arc<dyn PhysicalExpr>>) {
         self.filters = Some(conjunction(self.filters.take().into_iter().chain(filters)));
+    }
+
+    /// The columns the scan's dynamic filters refer to. Empty when dynamic filtering is off.
+    pub(crate) fn dynamic_filter_columns(&self) -> Vec<String> {
+        let Some(filters) = self
+            .filters
+            .as_ref()
+            .filter(|_| self.dynamic_filtering_enabled)
+        else {
+            return vec![];
+        };
+        let mut columns = dynamic_filters(filters)
+            .iter()
+            .flat_map(collect_columns)
+            .map(|column| column.name().to_string())
+            .collect::<Vec<_>>();
+        columns.sort_unstable();
+        columns.dedup();
+        columns
     }
 
     /// Visits the scan's filters when dynamic filtering is enabled.

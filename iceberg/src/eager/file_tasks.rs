@@ -13,7 +13,7 @@ use datafusion::common::{HashMap, Result, exec_datafusion_err};
 use iceberg::expr::BoundPredicate;
 use iceberg::scan::{FileScanTask, FileScanTaskColumnStats, FileScanTaskDeleteFile};
 use iceberg::spec::{
-    DataFileFormat, Literal, NameMapping, PartitionSpec, Schema, SortOrder, StructType, Type,
+    DataFileFormat, Datum, Literal, NameMapping, PartitionSpec, Schema, SortOrder, StructType, Type,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -28,9 +28,21 @@ pub(crate) struct FileTaskEncoder<'a> {
     sort_orders: Pool<'a, SortOrder>,
     predicates: Vec<&'a BoundPredicate>,
     file_partition_types: HashMap<(usize, Option<usize>), Type>,
+    /// The columns whose metrics each file keeps. See [`Self::with_bounds_columns`].
+    bounds_columns: Vec<String>,
 }
 
 impl<'a> FileTaskEncoder<'a> {
+    /// An encoder that keeps the metrics of `columns` on each file and drops the rest. Workers
+    /// check a file's bounds against the scan's dynamic filters before they open it, so only
+    /// the columns those filters use need metrics.
+    pub(crate) fn with_bounds_columns(columns: Vec<String>) -> Self {
+        Self {
+            bounds_columns: columns,
+            ..Self::default()
+        }
+    }
+
     /// Encodes one file. Its shared values are kept until [`Self::finish`].
     pub(crate) fn encode(&mut self, file: &'a FileScanTask) -> Result<Vec<u8>> {
         let schema = self.schemas.position(file.schema());
@@ -78,7 +90,9 @@ impl<'a> FileTaskEncoder<'a> {
             sort_order: file
                 .sort_order()
                 .map(|order| self.sort_orders.position(&**order)),
-            column_stats: file.column_stats(),
+            column_stats: file
+                .column_stats()
+                .and_then(|stats| self.bounds_metrics(file, stats)),
             case_sensitive: file.case_sensitive(),
             key_metadata: file.key_metadata(),
         };
@@ -99,6 +113,42 @@ impl<'a> FileTaskEncoder<'a> {
         rmp_serde::to_vec_named(&shared).map_err(|error| {
             exec_datafusion_err!("Cannot encode shared Iceberg file values: {error}")
         })
+    }
+
+    /// The metrics of `stats` for [`Self::bounds_columns`], or `None` if none are left.
+    fn bounds_metrics(
+        &self,
+        file: &FileScanTask,
+        stats: &FileScanTaskColumnStats,
+    ) -> Option<FileScanTaskColumnStats> {
+        let ids = self
+            .bounds_columns
+            .iter()
+            .filter_map(|name| file.schema().field_by_name(name))
+            .map(|field| field.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return None;
+        }
+        let pick = |values: &dyn Fn(i32) -> Option<u64>| {
+            ids.iter()
+                .filter_map(|&id| Some((id, values(id)?)))
+                .collect()
+        };
+        let pick_bound = |bounds: &dyn Fn(i32) -> Option<Datum>| {
+            ids.iter()
+                .filter_map(|&id| Some((id, bounds(id)?)))
+                .collect()
+        };
+        Some(
+            FileScanTaskColumnStats::builder()
+                .with_value_counts(pick(&|id| stats.value_counts().get(&id).copied()))
+                .with_null_value_counts(pick(&|id| stats.null_value_counts().get(&id).copied()))
+                .with_nan_value_counts(pick(&|id| stats.nan_value_counts().get(&id).copied()))
+                .with_lower_bounds(pick_bound(&|id| stats.lower_bounds().get(&id).cloned()))
+                .with_upper_bounds(pick_bound(&|id| stats.upper_bounds().get(&id).cloned()))
+                .build(),
+        )
     }
 
     /// Files of one scan usually share one predicate, so a file reuses the last one if equal.
@@ -306,7 +356,7 @@ struct FileRef<'a> {
     unified_partition_type: Option<usize>,
     sort_order_id: Option<i32>,
     sort_order: Option<usize>,
-    column_stats: Option<&'a FileScanTaskColumnStats>,
+    column_stats: Option<FileScanTaskColumnStats>,
     case_sensitive: bool,
     key_metadata: Option<&'a [u8]>,
 }
@@ -346,8 +396,9 @@ mod tests {
 
     use super::*;
 
-    fn roundtrip(files: &[FileScanTask]) -> Result<Vec<FileScanTask>> {
-        let mut encoder = FileTaskEncoder::default();
+    fn roundtrip(files: &[FileScanTask], bounds_columns: &[&str]) -> Result<Vec<FileScanTask>> {
+        let columns = bounds_columns.iter().map(|name| name.to_string()).collect();
+        let mut encoder = FileTaskEncoder::with_bounds_columns(columns);
         let encoded = files
             .iter()
             .map(|file| encoder.encode(file))
@@ -452,8 +503,8 @@ mod tests {
                 .build()
                 .unwrap(),
         ];
+        // Column sizes are only used while planning, so they are never encoded.
         let column_stats = FileScanTaskColumnStats::builder()
-            .with_column_sizes([(1, 64)].into_iter().collect())
             .with_value_counts([(1, 8)].into_iter().collect())
             .with_null_value_counts([(2, 1)].into_iter().collect())
             .with_lower_bounds([(1, Datum::long(1))].into_iter().collect())
@@ -494,7 +545,7 @@ mod tests {
     #[test]
     fn roundtrips_every_field() -> Result<()> {
         let files = files_with_every_field();
-        let decoded = roundtrip(&files)?;
+        let decoded = roundtrip(&files, &["id", "day"])?;
         assert_eq!(decoded, files);
         // The decoded files share the table's values again.
         assert!(Arc::ptr_eq(
@@ -505,6 +556,24 @@ mod tests {
             decoded[0].name_mapping().unwrap(),
             decoded[1].name_mapping().unwrap()
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_metrics_only_for_the_bounds_columns() -> Result<()> {
+        let decoded = roundtrip(&files_with_every_field(), &["day"])?;
+        let stats = decoded[0].column_stats().expect("metrics for `day`");
+        assert_eq!(stats.null_value_counts().get(&2), Some(&1));
+        assert!(stats.value_counts().is_empty());
+        assert!(stats.lower_bounds().is_empty());
+        assert!(stats.upper_bounds().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn drops_metrics_without_bounds_columns() -> Result<()> {
+        let decoded = roundtrip(&files_with_every_field(), &[])?;
+        assert!(decoded.iter().all(|file| file.column_stats().is_none()));
         Ok(())
     }
 

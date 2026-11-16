@@ -121,7 +121,8 @@ impl PhysicalExtensionCodec for EagerIcebergCodec {
         let Some(source) = exec.data_source().downcast_ref::<EagerIcebergDataSource>() else {
             return internal_err!("expected DataSourceExec wrapping EagerIcebergDataSource");
         };
-        let mut encoder = FileTaskEncoder::default();
+        let mut encoder =
+            FileTaskEncoder::with_bounds_columns(source.scan.dynamic_filter_columns());
         let partitions = (0..source.output_partitioning().partition_count())
             .map(|partition| {
                 let tasks = source
