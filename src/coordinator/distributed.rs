@@ -263,6 +263,7 @@ impl ExecutionPlan for DistributedExec {
             // 6. The response stream finishes, ending the query for the user.
             let _guard = guard;
 
+            eprintln!("DFDBG {} exec_start partition={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), partition);
             let d_cfg = DistributedConfig::from_config_options(context.session_config().options())?;
             let mut prepared = match d_cfg.dynamic_task_count {
                 true => prepare_dynamic_plan(&query_coordinator, &base_plan).await?,
@@ -278,6 +279,7 @@ impl ExecutionPlan for DistributedExec {
                 )?,
                 false => prepared.plan_for_viz,
             };
+            eprintln!("DFDBG {} tasks_prepared partition={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), partition);
             let head_stage = Arc::clone(&prepared.head_stage);
             prepared_plan.set(prepared).map_err(|_| {
                 internal_datafusion_err!("DistributedExec was already prepared for execution")
