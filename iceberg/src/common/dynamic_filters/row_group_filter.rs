@@ -105,7 +105,7 @@ fn keep_readable(predicate: &Predicate, readable: &dyn Fn(&Predicate) -> bool) -
             keep_readable(left, readable).and(keep_readable(right, readable))
         }
         // Debug switch: leave ORs out of the reader filter, to measure their per-row cost.
-        Predicate::Or(_) if std::env::var_os("DFDBG_READER_NO_OR").is_some() => {
+        Predicate::Or(_) if std::env::var_os("DFDBG_READER_KEEP_OR").is_none() => {
             Predicate::AlwaysTrue
         }
         Predicate::Or(expr) => {

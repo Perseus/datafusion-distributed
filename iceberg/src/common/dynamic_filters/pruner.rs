@@ -5,7 +5,10 @@ static DBG_REFRESH: AtomicUsize = AtomicUsize::new(0);
 static DBG_READER: AtomicUsize = AtomicUsize::new(0);
 
 fn dbg_now() -> u128 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn dbg_cut(s: String) -> String {
@@ -111,14 +114,28 @@ impl DynamicFilterPruner {
         self.refresh();
         let Some(predicate) = &self.predicate else {
             if DBG_READER.fetch_add(1, Ordering::Relaxed) < 40 {
-                eprintln!("DFDBG {} reader_filter none file={}", dbg_now(), task.data_file_path().rsplit('/').next().unwrap_or(""));
+                eprintln!(
+                    "DFDBG {} reader_filter none file={}",
+                    dbg_now(),
+                    task.data_file_path().rsplit('/').next().unwrap_or("")
+                );
             }
             return task;
         };
         let out = with_dynamic_filter(&task, predicate);
         if DBG_READER.fetch_add(1, Ordering::Relaxed) < 40 {
-            eprintln!("DFDBG {} reader_filter attached={} file={} task_predicate={}", dbg_now(), out.is_some(), task.data_file_path().rsplit('/').next().unwrap_or(""),
-                dbg_cut(format!("{:?}", out.as_ref().and_then(|t| t.predicate()).map(|p| p.to_string()))));
+            eprintln!(
+                "DFDBG {} reader_filter attached={} file={} task_predicate={}",
+                dbg_now(),
+                out.is_some(),
+                task.data_file_path().rsplit('/').next().unwrap_or(""),
+                dbg_cut(format!(
+                    "{:?}",
+                    out.as_ref()
+                        .and_then(|t| t.predicate())
+                        .map(|p| p.to_string())
+                ))
+            );
         }
         out.unwrap_or(task)
     }
@@ -203,9 +220,16 @@ impl DynamicFilterPruner {
             .as_ref()
             .and_then(convert_physical_filter_to_predicate);
         if DBG_REFRESH.fetch_add(1, Ordering::Relaxed) < 40 {
-            eprintln!("DFDBG {} filter_refresh generation={} snapshot={} predicate={}", dbg_now(), generation,
+            eprintln!(
+                "DFDBG {} filter_refresh generation={} snapshot={} predicate={}",
+                dbg_now(),
+                generation,
                 dbg_cut(format!("{:?}", snapshot.as_ref().map(|s| s.to_string()))),
-                dbg_cut(format!("{:?}", self.predicate.as_ref().map(|p| p.to_string()))));
+                dbg_cut(format!(
+                    "{:?}",
+                    self.predicate.as_ref().map(|p| p.to_string())
+                ))
+            );
         }
         self.bounds_predicate = snapshot.and_then(|snapshot| {
             PruningPredicateBuilder::new()
