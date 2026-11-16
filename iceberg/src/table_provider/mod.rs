@@ -1,5 +1,5 @@
 mod catalog;
-mod column_statistics;
+pub(crate) mod column_statistics;
 mod factory;
 pub(crate) mod scan;
 mod r#static;

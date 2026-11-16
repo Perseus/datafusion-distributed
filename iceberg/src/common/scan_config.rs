@@ -204,8 +204,14 @@ impl ScanConfig {
             return None;
         }
         let dynamic_filters = dynamic_filters(self.filters.as_ref()?);
-        (!dynamic_filters.is_empty())
-            .then(|| DynamicFilterPruner::new(dynamic_filters, &self.metrics, partition))
+        (!dynamic_filters.is_empty()).then(|| {
+            DynamicFilterPruner::new(
+                dynamic_filters,
+                Arc::clone(&self.schema),
+                &self.metrics,
+                partition,
+            )
+        })
     }
 }
 
