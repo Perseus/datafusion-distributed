@@ -14,6 +14,9 @@ cargo run -p datafusion-distributed-iceberg-benchmarks --release -- run \
   --workers 2 --dataset $ICEBERG -c datafusion.execution.target_partitions=2
 ```
 
+`run` also takes `iceberg.*` config options, from the config file or with `-c`, for example
+`-c iceberg.eager_file_planning=true`.
+
 Preparation writes an immutable `tpch_iceberg` dataset by default, whose path repeats the input's
 parameters followed by `partitioned` and `target_file_size`. `--partitioned` partitions the tables
 that the benchmark declares partition columns for.

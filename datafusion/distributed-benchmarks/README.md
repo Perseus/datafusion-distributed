@@ -244,8 +244,17 @@ branch defaults to the current branch. With `--dataset`, both positional
 arguments remain literal branch names. Each dataset uses the existing
 `.results/<branch>/` and `previous.json` layout.
 
+`dfbench-iceberg run` also takes `iceberg.*` config options, from the config file
+or with `-c`. The coordinator sends them to every worker with each query:
+
+```shell
+cargo run -p datafusion-distributed-iceberg-benchmarks --release -- run \
+  --workers 2 --dataset $ICEBERG -c iceberg.eager_file_planning=true
+```
+
 Absolute dataset paths are supported when they follow the same layout. Iceberg
-runs always load manifest column statistics. Source file boundaries come from
+runs load manifest column statistics; `-c iceberg.column_stats_enabled=false`
+turns that off. Source file boundaries come from
 the Parquet dataset's `--max-file-size`. Generated metadata contains absolute
 local locations; cloud publication and remote harness support remain separate
 work.

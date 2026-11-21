@@ -211,12 +211,6 @@ impl RunOpt {
             })
             .with_distributed_metrics_collection(true)?;
 
-        let config_entries = self.config_entries()?;
-        let options = builder.config().get_or_insert_default().options_mut();
-        for (key, value) in &config_entries {
-            options.set(key, value)?;
-        }
-
         if let Some(local_worker) = local_workers.workers.first() {
             let url = Url::parse(&format!("http://127.0.0.1:{}", local_workers.ports[0])).unwrap();
             builder.set_distributed_local_worker_context(local_worker.to_local_worker_context(url))
@@ -226,7 +220,16 @@ impl RunOpt {
             builder = builder.with_physical_optimizer_rule(Arc::new(WorkUnitFileScanRule))
         }
 
-        let state = backend.configure_session(builder).build();
+        // The backend can register config options of its own, such as `iceberg.*`. We set the
+        // config entries after it, so that they can name those options too.
+        let mut builder = backend.configure_session(builder);
+        let config_entries = self.config_entries()?;
+        let options = builder.config().get_or_insert_default().options_mut();
+        for (key, value) in &config_entries {
+            options.set(key, value)?;
+        }
+
+        let state = builder.build();
         let ctx = SessionContext::new_with_state(state);
         backend.register_tables(&ctx, &self.get_path()?).await?;
         let dataset_suite = dataset_suite(&self.dataset);

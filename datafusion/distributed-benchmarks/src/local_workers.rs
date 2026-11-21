@@ -46,11 +46,13 @@ impl LocalWorkers {
             // node when the feature is on. The codec is registered via a
             // session builder so it is installed on every worker session.
             let worker = Worker::from_session_builder(move |ctx: WorkerQueryContext| {
-                let builder = backend.configure_session(
-                    ctx.builder
+                let builder = backend.configure_worker_session(WorkerQueryContext {
+                    builder: ctx
+                        .builder
                         .with_distributed_user_codec(WorkUnitFileScanCodec),
-                );
-                async move { Ok(builder.build()) }
+                    headers: ctx.headers,
+                });
+                async move { Ok(builder?.build()) }
             });
             workers.push(worker.clone());
 
