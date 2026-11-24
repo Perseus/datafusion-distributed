@@ -104,7 +104,18 @@ pub(crate) fn selected_column_statistics(
     let rows = files.iter().try_fold(0_usize, |rows, task| {
         rows.checked_add(usize::try_from(task.record_count()?).ok()?)
     });
-    let ndvs = ndv_from_metadata(table, snapshot.snapshot_id());
+    // Snapshot Puffin sketches cover the whole snapshot and cannot be restricted
+    // to a pruned file subset or adjusted for unapplied deletes. Omit them when
+    // files were pruned (or cannot be shown to cover every snapshot data file)
+    // so downstream estimators do not apply a table-wide NDV to a narrow slice.
+    let has_deletes = files.iter().any(|task| !task.deletes().is_empty());
+    let snapshot_ndv_valid = !has_deletes
+        && (!may_filter_rows || snapshot_data_file_count(snapshot) == Some(files.len()));
+    let ndvs = if snapshot_ndv_valid {
+        ndv_from_metadata(table, snapshot.snapshot_id())
+    } else {
+        HashMap::new()
+    };
     Ok(statistics
         .into_iter()
         .zip(fields)
@@ -113,14 +124,21 @@ pub(crate) fn selected_column_statistics(
             if may_filter_rows {
                 stats.null_count = stats.null_count.to_inexact();
             }
-            // Snapshot sketches cannot be restricted to selected files. Retain their
-            // estimate, capped by the selected rows, without claiming exactness.
             if let Some(&ndv) = ndvs.get(&field.id) {
                 stats.distinct_count = Precision::Inexact(rows.map_or(ndv, |rows| ndv.min(rows)));
             }
             stats
         })
         .collect())
+}
+
+fn snapshot_data_file_count(snapshot: &SnapshotRef) -> Option<usize> {
+    snapshot
+        .summary()
+        .additional_properties
+        .get("total-data-files")?
+        .parse::<usize>()
+        .ok()
 }
 
 fn leaf_ids(field: &NestedFieldRef, ids: &mut Vec<i32>) {

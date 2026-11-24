@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filtered_statistics_use_selected_files_and_cap_snapshot_ndv()
+    async fn filtered_statistics_use_selected_files_and_omit_pruned_snapshot_ndv()
     -> Result<(), Box<dyn Error>> {
         let harness = harness_with_manifest_metrics().await?;
         // Manifest bounds select only the first file: passenger_count spans 10 to 20.
@@ -537,10 +537,11 @@ mod tests {
             stats.column_statistics[column].max_value,
             Precision::Inexact(ScalarValue::Int32(Some(9)))
         );
-        // The snapshot sketch claims 100,000 distinct values; the selected rows cap it.
+        // Only 1 of 2 snapshot files survived pruning, so the snapshot-wide NDV
+        // sketch does not describe this subset and must be omitted.
         assert_eq!(
             stats.column_statistics[column].distinct_count,
-            Precision::Inexact(SYNTHETIC_ROWS)
+            Precision::Absent
         );
         assert_eq!(
             stats.column_statistics[column].null_count,
