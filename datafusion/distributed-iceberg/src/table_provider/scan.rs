@@ -2,7 +2,7 @@ use crate::common::df_err;
 use crate::common::scan_config::ScanConfig;
 use crate::eager::assign_files;
 use crate::eager::planned_files::PlannedFiles;
-use crate::table_provider::column_statistics::compute_column_stats;
+use crate::table_provider::column_statistics::{ColumnStatsRequest, compute_column_stats};
 use crate::{EagerIcebergDataSource, IcebergConfig, IcebergWorkUnitFeed, LazyIcebergDataSource};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{Result, config_err, exec_err};
@@ -92,20 +92,33 @@ pub(crate) async fn plan_scan(
         || planned
             .as_ref()
             .is_some_and(|files| files.tasks().iter().any(|task| !task.deletes().is_empty()));
-    let column_stats = if IcebergConfig::from_task_context(&context).column_stats_enabled
-        && !(planned.is_some() && may_filter_rows)
-    {
+    let column_stats = if IcebergConfig::from_task_context(&context).column_stats_enabled {
         let schema = match &table_snapshot {
             Some(snap) => snap.schema(table.metadata()).map_err(df_err)?,
             // empty table
             None => table.metadata().current_schema().clone(),
         };
-        let fields = schema.as_struct().fields().to_vec();
-        let field_ids: Vec<i32> = match opts.projection {
-            Some(projection) => projection.iter().map(|&idx| fields[idx].id).collect(),
-            None => fields.iter().map(|f| f.id).collect(),
+        let all_fields = schema.as_struct().fields();
+        let fields = match opts.projection {
+            Some(projection) => projection
+                .iter()
+                .map(|&idx| Arc::clone(&all_fields[idx]))
+                .collect(),
+            None => all_fields.to_vec(),
         };
-        Some(compute_column_stats(table.clone(), field_ids, table_snapshot.clone()).await?)
+        Some(
+            compute_column_stats(
+                table.clone(),
+                ColumnStatsRequest {
+                    fields,
+                    snapshot: table_snapshot.clone(),
+                    selected_files: planned.as_ref().map(|files| files.tasks()),
+                    filters: opts.filters,
+                    may_filter_rows,
+                },
+            )
+            .await?,
+        )
     } else {
         None
     };
