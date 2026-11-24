@@ -195,9 +195,10 @@ impl fmt::Debug for ScanConfig {
 ///
 /// iceberg-rust defines them privately:
 /// https://github.com/apache/iceberg-rust/blob/4168a0b2950dc5f85588e5cb3ab6796e5228b309/crates/iceberg/src/spec/snapshot_summary.rs#L46-L47
-const TOTAL_RECORDS: &str = "total-records";
+pub(crate) const TOTAL_RECORDS: &str = "total-records";
 const TOTAL_FILE_SIZE: &str = "total-files-size";
 const TOTAL_DELETE_FILES: &str = "total-delete-files";
+pub(crate) const TOTAL_DATA_FILES: &str = "total-data-files";
 
 /// Getting stats out of snapshot's additional properties (no I/O overhead)
 pub(crate) fn stats_from_snapshot(

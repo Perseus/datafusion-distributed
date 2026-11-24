@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filtered_statistics_use_selected_files_and_cap_snapshot_ndv()
+    async fn filtered_statistics_use_selected_files_and_omit_fabricated_uniqueness()
     -> Result<(), Box<dyn Error>> {
         let harness = harness_with_manifest_metrics().await?;
         // Manifest bounds select only the first file: passenger_count spans 10 to 20.
@@ -537,10 +537,12 @@ mod tests {
             stats.column_statistics[column].max_value,
             Precision::Inexact(ScalarValue::Int32(Some(9)))
         );
-        // The snapshot sketch claims 100,000 distinct values; the selected rows cap it.
+        // The snapshot sketch claims 100,000 distinct values across the full snapshot
+        // (strictly non-unique vs snapshot total-records). Clamping it to the 87,500
+        // selected rows would fabricate 100% uniqueness, so NDV is omitted instead.
         assert_eq!(
             stats.column_statistics[column].distinct_count,
-            Precision::Inexact(SYNTHETIC_ROWS)
+            Precision::Absent
         );
         assert_eq!(
             stats.column_statistics[column].null_count,
@@ -548,6 +550,233 @@ mod tests {
         );
         // Both scan columns have sizes: vendor_id 100 + passenger_count 200.
         assert_eq!(stats.total_byte_size, Precision::Inexact(300));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pruned_scan_omits_filtered_and_clamped_ndv_while_unpruned_keeps_it()
+    -> Result<(), Box<dyn Error>> {
+        let harness = manifest_metrics_builder()
+            .await?
+            .with_metadata(vendor_and_passenger_ndv_sketches)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.column_stats_enabled", true)
+            .configure_session(|mut state| {
+                let session = state.config().get_or_insert_default();
+                session.options_mut().execution.target_partitions = 1;
+                state.with_distributed_file_scan_config_bytes_per_partition(1_000_000)
+            })?
+            .build()
+            .await?;
+
+        // File 1 has passenger_count in [10, 20], file 2 has [30, 40];
+        // `passenger_count = 15` prunes to only file 1. Snapshot NDV is omitted
+        // on the pruned filter column (`passenger_count`) to avoid double-counting,
+        // and omitted on `vendor_id` because clamping its non-unique snapshot NDV
+        // (100,000 < total-records) to 87,500 selected rows would fabricate uniqueness.
+        let pruned_source = scan_node(
+            &harness
+                .physical_plan(
+                    "SELECT vendor_id, passenger_count FROM taxi WHERE passenger_count = 15",
+                )
+                .await?,
+        )?;
+        let pruned_stats =
+            StatisticsContext::new().compute(pruned_source.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(pruned_stats.num_rows, Precision::Inexact(SYNTHETIC_ROWS));
+        assert_eq!(
+            pruned_stats.column_statistics[pruned_source.schema().index_of("passenger_count")?]
+                .distinct_count,
+            Precision::Absent
+        );
+        assert_eq!(
+            pruned_stats.column_statistics[pruned_source.schema().index_of("vendor_id")?]
+                .distinct_count,
+            Precision::Absent
+        );
+
+        // When a filter prunes zero files (both files survive), snapshot NDV stays valid.
+        let unpruned_source = scan_node(
+            &harness
+                .physical_plan("SELECT passenger_count FROM taxi WHERE passenger_count < 100")
+                .await?,
+        )?;
+        let unpruned_stats =
+            StatisticsContext::new().compute(unpruned_source.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(
+            unpruned_stats.column_statistics
+                [unpruned_source.schema().index_of("passenger_count")?]
+            .distinct_count,
+            Precision::Inexact(100_000)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pruned_scan_omits_clamped_non_unique_ndv_but_keeps_low_cardinality_ndv()
+    -> Result<(), Box<dyn Error>> {
+        // Snapshot has 2 * SYNTHETIC_ROWS (175,000) total records across 2 files:
+        // - vendor_id (field 1): NDV = 100,000 (< 175,000 non-unique, >= 87,500 selected)
+        //   -> clamping to 87,500 would fabricate uniqueness, so omit on pruned scans.
+        // - passenger_count (field 4, filtered): NDV = 500 (< 87,500 selected)
+        //   -> omitted solely because it is a pruned filter column (isolates is_filtered_pruned).
+        // - trip_distance (field 5, unfiltered): NDV = 500 (< 87,500 selected)
+        //   -> low-cardinality unfiltered column is retained for GROUP BY.
+        // - pickup_at (field 2, filtered unique): NDV = 171,500 (98% of 175,000, within sketch RSE)
+        //   -> every subset of a unique column stays unique, so cap to 87,500 even when filtered.
+        let harness = manifest_metrics_builder()
+            .await?
+            .with_metadata(|metadata| {
+                let current = metadata.current_snapshot().expect("taxi has a snapshot");
+                let mut props = current.summary().additional_properties.clone();
+                props.insert("total-records".to_owned(), (2 * SYNTHETIC_ROWS).to_string());
+                let updated = Snapshot::builder()
+                    .with_snapshot_id(current.snapshot_id())
+                    .with_parent_snapshot_id(current.parent_snapshot_id())
+                    .with_sequence_number(current.sequence_number())
+                    .with_timestamp_ms(current.timestamp_ms())
+                    .with_manifest_list(current.manifest_list())
+                    .schema_id_opt(current.schema_id())
+                    .with_summary(Summary {
+                        operation: current.summary().operation.clone(),
+                        additional_properties: props,
+                    })
+                    .build();
+                let statistics = StatisticsFile {
+                    snapshot_id: current.snapshot_id(),
+                    statistics_path: format!(
+                        "{}/metadata/non-unique-ndv.puffin",
+                        metadata.location()
+                    ),
+                    file_size_in_bytes: 128,
+                    file_footer_size_in_bytes: 64,
+                    key_metadata: None,
+                    blob_metadata: vec![
+                        BlobMetadata {
+                            r#type: APACHE_DATASKETCHES_THETA_V1.to_owned(),
+                            snapshot_id: current.snapshot_id(),
+                            sequence_number: current.sequence_number(),
+                            fields: vec![1],
+                            properties: [("ndv".to_owned(), "100000".to_owned())].into(),
+                        },
+                        BlobMetadata {
+                            r#type: APACHE_DATASKETCHES_THETA_V1.to_owned(),
+                            snapshot_id: current.snapshot_id(),
+                            sequence_number: current.sequence_number(),
+                            fields: vec![2],
+                            properties: [("ndv".to_owned(), "171500".to_owned())].into(),
+                        },
+                        BlobMetadata {
+                            r#type: APACHE_DATASKETCHES_THETA_V1.to_owned(),
+                            snapshot_id: current.snapshot_id(),
+                            sequence_number: current.sequence_number(),
+                            fields: vec![4],
+                            properties: [("ndv".to_owned(), "500".to_owned())].into(),
+                        },
+                        BlobMetadata {
+                            r#type: APACHE_DATASKETCHES_THETA_V1.to_owned(),
+                            snapshot_id: current.snapshot_id(),
+                            sequence_number: current.sequence_number(),
+                            fields: vec![5],
+                            properties: [("ndv".to_owned(), "500".to_owned())].into(),
+                        },
+                    ],
+                };
+                without_snapshots(metadata)
+                    .set_branch_snapshot(updated, MAIN_BRANCH)
+                    .expect("snapshot valid")
+                    .set_statistics(statistics)
+                    .build()
+                    .expect("metadata valid")
+                    .metadata
+            })
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.column_stats_enabled", true)
+            .configure_session(|mut state| {
+                let session = state.config().get_or_insert_default();
+                session.options_mut().execution.target_partitions = 1;
+                state.with_distributed_file_scan_config_bytes_per_partition(1_000_000)
+            })?
+            .build()
+            .await?;
+
+        let source = scan_node(
+            &harness
+                .physical_plan(
+                    "SELECT vendor_id, pickup_at, passenger_count, trip_distance FROM taxi \
+                     WHERE passenger_count = 15 AND pickup_at IS NOT NULL",
+                )
+                .await?,
+        )?;
+        let stats = StatisticsContext::new().compute(source.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(stats.num_rows, Precision::Inexact(SYNTHETIC_ROWS));
+        assert_eq!(
+            stats.column_statistics[source.schema().index_of("vendor_id")?].distinct_count,
+            Precision::Absent
+        );
+        assert_eq!(
+            stats.column_statistics[source.schema().index_of("passenger_count")?].distinct_count,
+            Precision::Absent
+        );
+        assert_eq!(
+            stats.column_statistics[source.schema().index_of("pickup_at")?].distinct_count,
+            Precision::Inexact(SYNTHETIC_ROWS)
+        );
+        assert_eq!(
+            stats.column_statistics[source.schema().index_of("trip_distance")?].distinct_count,
+            Precision::Inexact(500)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_total_data_files_treats_filtered_scan_as_pruned() -> Result<(), Box<dyn Error>>
+    {
+        let harness = manifest_metrics_builder()
+            .await?
+            .with_metadata(|metadata| {
+                let with_sketches = vendor_and_passenger_ndv_sketches(metadata);
+                metadata_without_summary_statistics(&with_sketches)
+            })
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.column_stats_enabled", true)
+            .configure_session(|mut state| {
+                let session = state.config().get_or_insert_default();
+                session.options_mut().execution.target_partitions = 1;
+                state.with_distributed_file_scan_config_bytes_per_partition(1_000_000)
+            })?
+            .build()
+            .await?;
+
+        // Without total-data-files summary, a filtered scan conservatively treats
+        // filtered columns as pruned and omits their snapshot NDV.
+        let filtered_source = scan_node(
+            &harness
+                .physical_plan("SELECT passenger_count FROM taxi WHERE passenger_count < 100")
+                .await?,
+        )?;
+        let filtered_stats =
+            StatisticsContext::new().compute(filtered_source.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(
+            filtered_stats.column_statistics
+                [filtered_source.schema().index_of("passenger_count")?]
+            .distinct_count,
+            Precision::Absent
+        );
+
+        // An unfiltered scan has no predicates and retains snapshot NDV even without total-data-files.
+        let full_source = scan_node(
+            &harness
+                .physical_plan("SELECT passenger_count FROM taxi")
+                .await?,
+        )?;
+        let full_stats =
+            StatisticsContext::new().compute(full_source.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(
+            full_stats.column_statistics[full_source.schema().index_of("passenger_count")?]
+                .distinct_count,
+            Precision::Inexact(100_000)
+        );
         Ok(())
     }
 
@@ -697,6 +926,45 @@ mod tests {
                 fields: vec![1],
                 properties: [("ndv".to_owned(), "100000".to_owned())].into(),
             }],
+        };
+        metadata
+            .clone()
+            .into_builder(None)
+            .set_statistics(statistics)
+            .build()
+            .expect("taxi metadata stays valid")
+            .metadata
+    }
+
+    // Attaches snapshot statistics sketches for both vendor_id (field 1) and
+    // passenger_count (field 4), each claiming 100,000 distinct values.
+    fn vendor_and_passenger_ndv_sketches(metadata: &TableMetadata) -> TableMetadata {
+        let snapshot = metadata.current_snapshot().expect("taxi has a snapshot");
+        let statistics = StatisticsFile {
+            snapshot_id: snapshot.snapshot_id(),
+            statistics_path: format!(
+                "{}/metadata/unopened-statistics.puffin",
+                metadata.location()
+            ),
+            file_size_in_bytes: 0,
+            file_footer_size_in_bytes: 0,
+            key_metadata: None,
+            blob_metadata: vec![
+                BlobMetadata {
+                    r#type: APACHE_DATASKETCHES_THETA_V1.to_owned(),
+                    snapshot_id: snapshot.snapshot_id(),
+                    sequence_number: snapshot.sequence_number(),
+                    fields: vec![1],
+                    properties: [("ndv".to_owned(), "100000".to_owned())].into(),
+                },
+                BlobMetadata {
+                    r#type: APACHE_DATASKETCHES_THETA_V1.to_owned(),
+                    snapshot_id: snapshot.snapshot_id(),
+                    sequence_number: snapshot.sequence_number(),
+                    fields: vec![4],
+                    properties: [("ndv".to_owned(), "100000".to_owned())].into(),
+                },
+            ],
         };
         metadata
             .clone()

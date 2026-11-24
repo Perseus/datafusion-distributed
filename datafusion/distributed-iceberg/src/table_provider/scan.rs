@@ -7,7 +7,7 @@ use crate::table_provider::column_statistics::{
 };
 use crate::{EagerIcebergDataSource, IcebergConfig, IcebergWorkUnitFeed, LazyIcebergDataSource};
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::{Result, config_err, exec_err};
+use datafusion::common::{HashSet, Result, config_err, exec_err};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::Partitioning;
@@ -117,16 +117,25 @@ pub(crate) async fn plan_scan(
         || planned
             .as_ref()
             .is_some_and(|files| files.tasks().iter().any(|task| !task.deletes().is_empty()));
-    let column_stats = if let Some((_, fields)) = &stats_fields {
+    let column_stats = if let Some((iceberg_schema, fields)) = &stats_fields {
         if let Some(files) = &planned
             && let Some(snapshot) = &table_snapshot
         {
+            let filtered_field_ids: HashSet<i32> = opts
+                .filters
+                .iter()
+                .flat_map(|expr| expr.column_refs())
+                .filter_map(|col| iceberg_schema.field_by_name(&col.name))
+                .map(|field| field.id)
+                .collect();
             Some(selected_column_statistics(
                 &table,
                 snapshot,
                 fields,
                 files.tasks(),
                 may_filter_rows,
+                predicates.is_some(),
+                &filtered_field_ids,
             )?)
         } else {
             let field_ids = fields.iter().map(|field| field.id).collect();

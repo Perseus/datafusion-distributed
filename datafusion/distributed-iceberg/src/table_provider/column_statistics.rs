@@ -1,7 +1,8 @@
 use crate::common::df_err;
+use crate::common::scan_config::{TOTAL_DATA_FILES, TOTAL_RECORDS};
 use datafusion::common::runtime::JoinSet;
 use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, HashMap, Result, exec_err};
+use datafusion::common::{ColumnStatistics, HashMap, HashSet, Result, exec_err};
 use datafusion::error::DataFusionError;
 use datafusion::scalar::ScalarValue;
 use iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
@@ -48,6 +49,8 @@ pub(crate) fn selected_column_statistics(
     fields: &[NestedFieldRef],
     files: &[FileScanTask],
     may_filter_rows: bool,
+    has_predicates: bool,
+    filtered_field_ids: &HashSet<i32>,
 ) -> Result<Vec<ColumnStatistics>> {
     if files.is_empty() || fields.is_empty() {
         return Ok(vec![
@@ -104,6 +107,8 @@ pub(crate) fn selected_column_statistics(
     let rows = files.iter().try_fold(0_usize, |rows, task| {
         rows.checked_add(usize::try_from(task.record_count()?).ok()?)
     });
+    let files_pruned = has_predicates && snapshot_data_file_count(snapshot) != Some(files.len());
+    let total_snapshot_rows = snapshot_record_count(snapshot);
     let ndvs = ndv_from_metadata(table, snapshot.snapshot_id());
     Ok(statistics
         .into_iter()
@@ -113,14 +118,45 @@ pub(crate) fn selected_column_statistics(
             if may_filter_rows {
                 stats.null_count = stats.null_count.to_inexact();
             }
-            // Snapshot sketches cannot be restricted to selected files. Retain their
-            // estimate, capped by the selected rows, without claiming exactness.
             if let Some(&ndv) = ndvs.get(&field.id) {
-                stats.distinct_count = Precision::Inexact(rows.map_or(ndv, |rows| ndv.min(rows)));
+                // Treat columns with NDV within 3% of snapshot total-records (Theta sketch
+                // ~1.5% RSE) as unique: every subset of a unique column stays unique.
+                let is_snapshot_unique = total_snapshot_rows
+                    .is_some_and(|total| total > 0 && (ndv as f64) >= (total as f64) * 0.97);
+                let is_filtered_pruned =
+                    files_pruned && !is_snapshot_unique && filtered_field_ids.contains(&field.id);
+                // On a pruned scan, clamping a non-unique snapshot NDV down to `selected_rows`
+                // would fabricate 100% uniqueness for the pruned slice. Omit NDV instead while
+                // preserving unique columns and low-cardinality columns (`ndv < selected_rows`).
+                let fabricates_uniqueness = files_pruned
+                    && !is_snapshot_unique
+                    && rows.is_some_and(|selected_rows| ndv >= selected_rows);
+                if !is_filtered_pruned && !fabricates_uniqueness {
+                    stats.distinct_count =
+                        Precision::Inexact(rows.map_or(ndv, |rows| ndv.min(rows)));
+                }
             }
             stats
         })
         .collect())
+}
+
+fn snapshot_data_file_count(snapshot: &SnapshotRef) -> Option<usize> {
+    snapshot
+        .summary()
+        .additional_properties
+        .get(TOTAL_DATA_FILES)?
+        .parse::<usize>()
+        .ok()
+}
+
+fn snapshot_record_count(snapshot: &SnapshotRef) -> Option<usize> {
+    snapshot
+        .summary()
+        .additional_properties
+        .get(TOTAL_RECORDS)?
+        .parse::<usize>()
+        .ok()
 }
 
 fn leaf_ids(field: &NestedFieldRef, ids: &mut Vec<i32>) {

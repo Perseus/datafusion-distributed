@@ -323,13 +323,44 @@ pub fn data_file_name(path: &str) -> &str {
 }
 
 /// Writes a manifest of `files` and points the current snapshot's manifest list at it,
-/// creating a snapshot when the metadata has none. Snapshot identity and summary are kept.
+/// creating a snapshot when the metadata has none. Snapshot identity and existing summary
+/// fields are kept, updating `total-data-files` if already present so it matches `files.len()`.
 async fn replace_manifest_with(
     table: &FixtureTable,
     metadata: TableMetadata,
     files: Vec<DataFile>,
 ) -> Result<TableMetadata> {
-    let metadata = if metadata.current_snapshot().is_none() {
+    let file_count = files.len().to_string();
+    let metadata = if let Some(existing) = metadata.current_snapshot().cloned() {
+        let mut props = existing.summary().additional_properties.clone();
+        if props.contains_key("total-data-files") {
+            props.insert("total-data-files".to_owned(), file_count);
+        }
+        let updated = Snapshot::builder()
+            .with_snapshot_id(existing.snapshot_id())
+            .with_parent_snapshot_id(existing.parent_snapshot_id())
+            .with_sequence_number(existing.sequence_number())
+            .with_timestamp_ms(existing.timestamp_ms())
+            .with_manifest_list(existing.manifest_list())
+            .with_schema_id(
+                existing
+                    .schema_id()
+                    .unwrap_or_else(|| metadata.current_schema_id()),
+            )
+            .with_summary(Summary {
+                operation: existing.summary().operation.clone(),
+                additional_properties: props,
+            })
+            .build();
+        metadata
+            .into_builder(None)
+            .remove_snapshots(&[existing.snapshot_id()])
+            .set_branch_snapshot(updated, MAIN_BRANCH)
+            .map_err(df_err)?
+            .build()
+            .map_err(df_err)?
+            .metadata
+    } else {
         let snapshot = Snapshot::builder()
             .with_snapshot_id(1)
             .with_sequence_number(1)
@@ -341,7 +372,7 @@ async fn replace_manifest_with(
             .with_schema_id(metadata.current_schema_id())
             .with_summary(Summary {
                 operation: Operation::Append,
-                additional_properties: Default::default(),
+                additional_properties: [("total-data-files".to_owned(), file_count)].into(),
             })
             .build();
         metadata
@@ -351,8 +382,6 @@ async fn replace_manifest_with(
             .build()
             .map_err(df_err)?
             .metadata
-    } else {
-        metadata
     };
     let snapshot = metadata
         .current_snapshot()
