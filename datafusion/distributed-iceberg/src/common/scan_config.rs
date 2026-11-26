@@ -7,6 +7,7 @@ use datafusion::common::{ColumnStatistics, Statistics};
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::{DynamicFilterPhysicalExpr, InListExpr, lit};
+use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::{Partitioning, PhysicalExpr, conjunction, split_conjunction};
 use datafusion::physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion::physical_plan::apply_expression_roots;
@@ -17,7 +18,7 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream::poll_fn;
 use futures::{StreamExt, TryStreamExt};
-use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
+use iceberg::arrow::{ArrowReader, ArrowReaderBuilder, ArrowReaderOptions};
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTaskStream;
 use iceberg::spec::SnapshotRef;
@@ -38,6 +39,8 @@ pub(crate) struct ScanConfig {
     pub(crate) iceberg_runtime: iceberg::Runtime,
     pub(crate) filters: Option<Arc<dyn PhysicalExpr>>,
     pub(crate) dynamic_filtering_enabled: bool,
+    /// The largest IN list in a dynamic filter that we check against file column stats.
+    max_in_list_size: usize,
     // Clones share the delete loader across this source's local partitions.
     reader: ArrowReader,
 }
@@ -52,11 +55,14 @@ impl ScanConfig {
         context: &TaskContext,
     ) -> Self {
         let config = IcebergConfig::from_config_options(context.session_config().options());
-        let reader = ArrowReaderBuilder::new(iceberg_file_io.clone(), iceberg_runtime.clone())
+        let options = ArrowReaderOptions::builder()
             .with_batch_size(context.session_config().batch_size())
             .with_data_file_concurrency_limit(config.data_file_concurrency_limit)
             .with_row_group_filtering_enabled(config.row_group_filtering_enabled)
             .with_row_selection_enabled(config.row_selection_enabled)
+            .build();
+        let reader = ArrowReaderBuilder::new(iceberg_file_io.clone(), iceberg_runtime.clone())
+            .with_options(options)
             .build();
         Self {
             schema,
@@ -67,6 +73,12 @@ impl ScanConfig {
             iceberg_runtime,
             filters: None,
             dynamic_filtering_enabled: config.dynamic_filtering_enabled,
+            max_in_list_size: context
+                .session_config()
+                .options()
+                .execution
+                .parquet
+                .max_in_list_size,
             reader,
         }
     }
@@ -132,6 +144,26 @@ impl ScanConfig {
         Ok(())
     }
 
+    /// The names of the columns that the scan's dynamic filters use. A dynamic filter names its
+    /// columns as soon as it's pushed down, before it has any values. Empty when dynamic
+    /// filtering is off.
+    pub(crate) fn dynamic_filter_columns(&self) -> Vec<String> {
+        if !self.dynamic_filtering_enabled {
+            return vec![];
+        }
+        let Some(filters) = &self.filters else {
+            return vec![];
+        };
+        let mut columns: Vec<String> = dynamic_filters(filters)
+            .iter()
+            .flat_map(collect_columns)
+            .map(|column| column.name().to_string())
+            .collect();
+        columns.sort_unstable();
+        columns.dedup();
+        columns
+    }
+
     pub(crate) fn open(
         &self,
         tasks: FileScanTaskStream,
@@ -187,8 +219,15 @@ impl ScanConfig {
             return None;
         }
         let dynamic_filters = dynamic_filters(self.filters.as_ref()?);
-        (!dynamic_filters.is_empty())
-            .then(|| DynamicFilterPruner::new(dynamic_filters, &self.metrics, partition))
+        (!dynamic_filters.is_empty()).then(|| {
+            DynamicFilterPruner::new(
+                dynamic_filters,
+                Arc::clone(&self.schema),
+                self.max_in_list_size,
+                &self.metrics,
+                partition,
+            )
+        })
     }
 }
 

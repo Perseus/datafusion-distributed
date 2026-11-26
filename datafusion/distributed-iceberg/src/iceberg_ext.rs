@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::{SessionState, SessionStateBuilder};
+use datafusion::optimizer::OptimizerRule;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_distributed::DistributedExt;
 use delegate::delegate;
@@ -11,6 +12,7 @@ use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use crate::LazyIcebergCodec;
 use crate::distributed_desired_task_count_handler::iceberg_desired_task_count;
 use crate::distributed_scale_up_handler::iceberg_scale_up;
+use crate::table_provider::RequestDynamicFilterStatistics;
 use crate::{EagerIcebergCodec, IcebergFileIOCodec};
 use crate::{IcebergConfig, IcebergTableProviderFactory, LazyIcebergDataSource};
 
@@ -147,6 +149,19 @@ fn set_iceberg_integration(state: &mut SessionState, options: IcebergIntegration
     });
     state.set_distributed_user_codec(lazy);
     state.set_distributed_user_codec(eager);
+    if !has_statistics_requests_rule(state.optimizers()) {
+        *state = SessionStateBuilder::new_from_existing(state.clone())
+            .with_optimizer_rule(Arc::new(RequestDynamicFilterStatistics))
+            .build();
+    }
+}
+
+/// Whether `rules` already has the rule that asks Iceberg scans for column stats. We check so
+/// that setting up the integration twice doesn't run the rule twice.
+fn has_statistics_requests_rule(rules: &[Arc<dyn OptimizerRule + Send + Sync>]) -> bool {
+    rules
+        .iter()
+        .any(|rule| rule.name() == RequestDynamicFilterStatistics::NAME)
 }
 
 impl IcebergExt for SessionStateBuilder {
@@ -184,6 +199,14 @@ impl IcebergExt for SessionStateBuilder {
         });
         self.set_distributed_user_codec(lazy);
         self.set_distributed_user_codec(eager);
+        let registered = self
+            .optimizer()
+            .as_ref()
+            .is_some_and(|optimizer| has_statistics_requests_rule(&optimizer.rules));
+        let rules = self.optimizer_rules().get_or_insert_default();
+        if !registered && !has_statistics_requests_rule(rules) {
+            rules.push(Arc::new(RequestDynamicFilterStatistics));
+        }
     }
 
     delegate! {

@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::catalog::{Session, TableProvider};
+use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
 use datafusion::common::{Result, exec_datafusion_err, plan_datafusion_err};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 
+use super::requested_stats_columns;
 use super::scan::{IcebergDataSourceOptions, plan_scan};
 use crate::common::df_err;
 
@@ -70,6 +71,18 @@ impl TableProvider for IcebergStaticTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let args = ScanArgs::default()
+            .with_projection(projection)
+            .with_filters(Some(filters))
+            .with_limit(limit);
+        Ok(self.scan_with_args(state, args).await?.into_inner())
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> Result<ScanResult> {
         // Guard for invalid snapshot id's
         if let Some(id) = self.snapshot_id
             && self.table.metadata().snapshot_by_id(id).is_none()
@@ -78,19 +91,21 @@ impl TableProvider for IcebergStaticTableProvider {
                 "Snapshot {id} not found in table's metadata"
             ));
         }
-        plan_scan(
+        let plan = plan_scan(
             self.table.clone(),
             self.schema.clone(),
             IcebergDataSourceOptions {
                 snapshot_id: self.snapshot_id,
-                projection,
-                filters,
-                fetch: limit,
+                projection: args.projection(),
+                filters: args.filters().unwrap_or_default(),
+                fetch: args.limit(),
+                stats_columns: requested_stats_columns(args.statistics_requests()),
                 iceberg_runtime: Some(self.iceberg_runtime.clone()),
             },
             state.task_ctx(),
         )
-        .await
+        .await?;
+        Ok(plan.into())
     }
 
     fn supports_filters_pushdown(

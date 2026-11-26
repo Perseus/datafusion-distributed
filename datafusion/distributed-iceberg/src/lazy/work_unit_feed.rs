@@ -18,6 +18,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::common::{df_err, file_partition};
+use crate::table_provider::scan::stats_columns;
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct SerializedFileScanTask {
@@ -177,6 +178,8 @@ pub struct IcebergWorkUnitFeed {
     pub(crate) projection: Option<Vec<String>>,
     /// Filters to apply to the table scan.
     pub(crate) predicates: Option<Predicate>,
+    /// Columns whose stats each file task keeps, so workers can skip files with them.
+    pub(crate) stats_columns: Vec<String>,
     /// Partitioning scheme to which the feeds should adhere.
     /// TODO: Today, only Partitioning::UnknownPartitioning partitioning is supported.
     ///  Ideally, both Range partitioning and hash partitioning should be supported.
@@ -186,6 +189,19 @@ pub struct IcebergWorkUnitFeed {
     pub(crate) sync_manager: OnceLock<Result<SyncManager, Arc<DataFusionError>>>,
 }
 
+impl IcebergWorkUnitFeed {
+    /// Asks the scan to also keep stats for `columns` on each file task. Columns that the
+    /// `iceberg` crate has no stats for are left out.
+    pub(crate) fn request_stats_columns(&mut self, columns: &[String]) -> Result<()> {
+        for column in stats_columns(&self.iceberg_table, self.snapshot_id, columns)? {
+            if !self.stats_columns.contains(&column) {
+                self.stats_columns.push(column);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Clone for IcebergWorkUnitFeed {
     fn clone(&self) -> Self {
         Self {
@@ -193,6 +209,7 @@ impl Clone for IcebergWorkUnitFeed {
             snapshot_id: self.snapshot_id,
             projection: self.projection.clone(),
             predicates: self.predicates.clone(),
+            stats_columns: self.stats_columns.clone(),
             partitioning: self.partitioning.clone(),
             sync_manager: Default::default(),
         }
@@ -233,6 +250,9 @@ impl WorkUnitFeedProvider for IcebergWorkUnitFeed {
             };
             if let Some(pred) = &self.predicates {
                 scan_builder = scan_builder.with_filter(pred.clone());
+            }
+            if !self.stats_columns.is_empty() {
+                scan_builder = scan_builder.with_column_stats(&self.stats_columns);
             }
             let table_scan = scan_builder.build().map_err(df_err)?;
 
