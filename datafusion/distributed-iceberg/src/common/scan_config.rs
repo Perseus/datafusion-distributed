@@ -17,7 +17,7 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream::poll_fn;
 use futures::{StreamExt, TryStreamExt};
-use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
+use iceberg::arrow::{ArrowReader, ArrowReaderBuilder, ArrowReaderOptions};
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTaskStream;
 use iceberg::spec::SnapshotRef;
@@ -52,11 +52,14 @@ impl ScanConfig {
         context: &TaskContext,
     ) -> Self {
         let config = IcebergConfig::from_config_options(context.session_config().options());
-        let reader = ArrowReaderBuilder::new(iceberg_file_io.clone(), iceberg_runtime.clone())
+        let options = ArrowReaderOptions::builder()
             .with_batch_size(context.session_config().batch_size())
             .with_data_file_concurrency_limit(config.data_file_concurrency_limit)
             .with_row_group_filtering_enabled(config.row_group_filtering_enabled)
             .with_row_selection_enabled(config.row_selection_enabled)
+            .build();
+        let reader = ArrowReaderBuilder::new(iceberg_file_io.clone(), iceberg_runtime.clone())
+            .with_options(options)
             .build();
         Self {
             schema,
