@@ -18,6 +18,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::common::{df_err, file_partition};
+use crate::table_provider::scan::stats_columns;
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct SerializedFileScanTask {
@@ -186,6 +187,19 @@ pub struct IcebergWorkUnitFeed {
     /// Container for the lazily initialized task that scans the Iceberg table.
     /// It will start as soon as the first [IcebergWorkUnitFeed::feed] is called.
     pub(crate) sync_manager: OnceLock<Result<SyncManager, Arc<DataFusionError>>>,
+}
+
+impl IcebergWorkUnitFeed {
+    /// Asks the scan to also keep stats for `columns` on each file task. Columns that the
+    /// `iceberg` crate has no stats for are left out.
+    pub(crate) fn request_stats_columns(&mut self, columns: &[String]) -> Result<()> {
+        for column in stats_columns(&self.iceberg_table, self.snapshot_id, columns)? {
+            if !self.stats_columns.contains(&column) {
+                self.stats_columns.push(column);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Clone for IcebergWorkUnitFeed {

@@ -150,7 +150,7 @@ pub(crate) async fn plan_scan(
 /// The requested columns that iceberg-rust keeps stats for. It fails a scan that asks for a
 /// missing or nested column, so we keep only the top-level primitive columns of the schema the
 /// scan reads.
-fn stats_columns(
+pub(crate) fn stats_columns(
     table: &Table,
     snapshot_id: Option<i64>,
     requested: &[String],

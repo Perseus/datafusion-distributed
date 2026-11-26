@@ -97,6 +97,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eager_planning_follows_join_keys_through_aliases() -> Result<(), Box<dyn Error>> {
+        let harness = IcebergTestHarness::builder()
+            .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
+            .with_table(events().await?)
+            .with_config_option("iceberg.eager_file_planning", true)
+            .with_config_option("iceberg.dynamic_filtering_enabled", true)
+            .with_workers(2)
+            .configure_session(|state| {
+                state.with_distributed_file_scan_config_bytes_per_partition(1)
+            })?
+            .build()
+            .await?;
+
+        // The join key is `e.event_id`, which is `events.id` under a new name and table alias.
+        let plan = harness
+            .physical_plan(
+                "SELECT COUNT(*) AS events FROM (SELECT id AS event_id FROM events) AS e \
+                 JOIN (VALUES (CAST(15 AS BIGINT)), (CAST(25 AS BIGINT))) AS keys(id) \
+                 ON e.event_id = keys.id",
+            )
+            .await?;
+        let batches = collect(Arc::clone(&plan), harness.state().task_ctx()).await?;
+        let plan =
+            rewrite_distributed_plan_with_metrics(plan, DistributedMetricsFormat::Aggregated)
+                .await?;
+
+        insta::assert_snapshot!(pretty_format_batches(&batches)?, @"
+        +--------+
+        | events |
+        +--------+
+        | 2      |
+        +--------+
+        ");
+        assert_eq!(
+            node_metrics::<DistributedLeafExec>(&plan, "files_opened", 0),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn top_n_skips_files_once_it_fills_up() -> Result<(), Box<dyn Error>> {
         let harness = IcebergTestHarness::builder()
             .with_session_extension(|state| state.with_iceberg_integration(Default::default()))
