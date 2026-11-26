@@ -38,6 +38,8 @@ pub(crate) struct ScanConfig {
     pub(crate) iceberg_runtime: iceberg::Runtime,
     pub(crate) filters: Option<Arc<dyn PhysicalExpr>>,
     pub(crate) dynamic_filtering_enabled: bool,
+    /// The largest IN list in a dynamic filter that we check against file column stats.
+    max_in_list_size: usize,
     // Clones share the delete loader across this source's local partitions.
     reader: ArrowReader,
 }
@@ -70,6 +72,12 @@ impl ScanConfig {
             iceberg_runtime,
             filters: None,
             dynamic_filtering_enabled: config.dynamic_filtering_enabled,
+            max_in_list_size: context
+                .session_config()
+                .options()
+                .execution
+                .parquet
+                .max_in_list_size,
             reader,
         }
     }
@@ -190,8 +198,15 @@ impl ScanConfig {
             return None;
         }
         let dynamic_filters = dynamic_filters(self.filters.as_ref()?);
-        (!dynamic_filters.is_empty())
-            .then(|| DynamicFilterPruner::new(dynamic_filters, &self.metrics, partition))
+        (!dynamic_filters.is_empty()).then(|| {
+            DynamicFilterPruner::new(
+                dynamic_filters,
+                Arc::clone(&self.schema),
+                self.max_in_list_size,
+                &self.metrics,
+                partition,
+            )
+        })
     }
 }
 

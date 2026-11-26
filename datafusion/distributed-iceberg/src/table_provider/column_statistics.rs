@@ -176,7 +176,7 @@ fn data_file_col_stats(df: &DataFile, id: i32) -> ColumnStatistics {
 }
 
 /// Conversion function of iceberg's Datum
-fn datum_to_scalar(d: &Datum) -> Option<ScalarValue> {
+pub(crate) fn datum_to_scalar(d: &Datum) -> Option<ScalarValue> {
     match (d.data_type(), d.literal()) {
         (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(v)) => {
             Some(ScalarValue::Boolean(Some(*v)))

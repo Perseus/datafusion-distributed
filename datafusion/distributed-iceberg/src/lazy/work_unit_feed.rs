@@ -177,6 +177,8 @@ pub struct IcebergWorkUnitFeed {
     pub(crate) projection: Option<Vec<String>>,
     /// Filters to apply to the table scan.
     pub(crate) predicates: Option<Predicate>,
+    /// Columns whose stats each file task keeps, so workers can skip files with them.
+    pub(crate) stats_columns: Vec<String>,
     /// Partitioning scheme to which the feeds should adhere.
     /// TODO: Today, only Partitioning::UnknownPartitioning partitioning is supported.
     ///  Ideally, both Range partitioning and hash partitioning should be supported.
@@ -193,6 +195,7 @@ impl Clone for IcebergWorkUnitFeed {
             snapshot_id: self.snapshot_id,
             projection: self.projection.clone(),
             predicates: self.predicates.clone(),
+            stats_columns: self.stats_columns.clone(),
             partitioning: self.partitioning.clone(),
             sync_manager: Default::default(),
         }
@@ -233,6 +236,9 @@ impl WorkUnitFeedProvider for IcebergWorkUnitFeed {
             };
             if let Some(pred) = &self.predicates {
                 scan_builder = scan_builder.with_filter(pred.clone());
+            }
+            if !self.stats_columns.is_empty() {
+                scan_builder = scan_builder.with_column_stats(&self.stats_columns);
             }
             let table_scan = scan_builder.build().map_err(df_err)?;
 

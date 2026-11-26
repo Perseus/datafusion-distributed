@@ -6,7 +6,8 @@ use datafusion::common::{Result, Statistics};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use futures::TryStreamExt;
-use iceberg::scan::{FileScanTask, TableScan};
+use iceberg::scan::{FileScanTask, FileScanTaskColumnStats, TableScan};
+use iceberg::spec::{Datum, PrimitiveLiteral};
 
 use crate::common::df_err;
 
@@ -86,12 +87,39 @@ fn retained_size(task: &FileScanTask) -> usize {
         + size_of_val(task.project_field_ids())
         + size_of_val(task.deletes())
         + task.key_metadata().map_or(0, <[u8]>::len);
+    if let Some(stats) = task.column_stats() {
+        bytes = bytes.saturating_add(column_stats_size(stats));
+    }
     for delete in task.deletes() {
         bytes = bytes
             .saturating_add(delete.file_path().len())
             .saturating_add(delete.referenced_data_file().map_or(0, str::len))
             .saturating_add(delete.equality_ids().map_or(0, size_of_val))
             .saturating_add(delete.key_metadata().map_or(0, <[u8]>::len));
+    }
+    bytes
+}
+
+/// An estimate of the memory that a task's column stats hold.
+fn column_stats_size(stats: &FileScanTaskColumnStats) -> usize {
+    // Each map entry holds a field id and a value. Strings and binary values hold their bytes
+    // outside the entry.
+    let counts = stats.column_sizes().len()
+        + stats.value_counts().len()
+        + stats.null_value_counts().len()
+        + stats.nan_value_counts().len();
+    let bounds = stats
+        .lower_bounds()
+        .values()
+        .chain(stats.upper_bounds().values());
+    let mut bytes = size_of_val(stats) + counts * size_of::<(i32, u64)>();
+    for bound in bounds {
+        bytes = bytes.saturating_add(size_of::<(i32, Datum)>());
+        bytes = bytes.saturating_add(match bound.literal() {
+            PrimitiveLiteral::String(value) => value.len(),
+            PrimitiveLiteral::Binary(value) => value.len(),
+            _ => 0,
+        });
     }
     bytes
 }
