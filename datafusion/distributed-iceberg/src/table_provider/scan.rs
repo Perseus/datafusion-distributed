@@ -156,6 +156,8 @@ pub(crate) async fn plan_scan(
         snapshot_id: opts.snapshot_id,
         projection,
         predicates,
+        // The lazy source adds the dynamic filter columns when DataFusion pushes the filters in.
+        stats_columns: Vec::new(),
         partitioning,
         sync_manager: Default::default(),
     });
@@ -165,4 +167,33 @@ pub(crate) async fn plan_scan(
         table_snapshot,
         column_stats,
     }))
+}
+
+/// The requested columns that iceberg-rust keeps stats for. It fails a scan that asks for a
+/// missing or nested column, so we keep only the top-level primitive columns of the schema the
+/// scan reads.
+pub(crate) fn stats_columns(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    requested: &[String],
+) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        return Ok(vec![]);
+    }
+    // iceberg-rust reads a time-travel scan with its snapshot's schema, and any other scan with
+    // the current schema.
+    let schema = match snapshot_id.and_then(|id| table.metadata().snapshot_by_id(id)) {
+        Some(snapshot) => snapshot.schema(table.metadata()).map_err(df_err)?,
+        None => table.metadata().current_schema().clone(),
+    };
+    Ok(requested
+        .iter()
+        .filter(|name| {
+            schema
+                .as_struct()
+                .field_by_name(name)
+                .is_some_and(|field| field.field_type.is_primitive())
+        })
+        .cloned()
+        .collect())
 }

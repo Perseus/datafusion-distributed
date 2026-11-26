@@ -223,6 +223,12 @@ impl DataSource for LazyIcebergDataSource {
         }
         let mut source = self.clone();
         source.scan.push_filters(filters);
+        // The feed lists files when the query runs, after DataFusion has pushed every dynamic
+        // filter into the scan. So we ask it to keep stats for exactly the columns those filters
+        // use, and workers can skip files with them.
+        if let Some(feed) = source.feed.inner_mut() {
+            feed.request_stats_columns(&source.scan.dynamic_filter_columns())?;
+        }
         Ok(result.with_updated_node(Arc::new(source)))
     }
 
